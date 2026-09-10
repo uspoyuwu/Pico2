@@ -20,6 +20,9 @@ cmake_minimum_required(VERSION 3.13)
 # include the sdk.cmake file
 include(pico_sdk_import.cmake)
 
+# Generate compile_commands.json for VS Code IntelliSense
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # give the project a name (anything you want)
 project(Keypad C CXX ASM)
 
@@ -44,5 +47,6 @@ target_link_libraries(  Keypad
                         hardware_clocks
                         hardware_adc)
 
+pico_enable_stdio_uart(Keypad 1)                 
 # must match with executable name
 pico_add_extra_outputs(Keypad)
