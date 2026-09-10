@@ -138,8 +138,28 @@ volatile int record_index = 0;
 // ==========================================
 // Playback
 // ==========================================
+#define PLAYBACK_SPEED 1
 volatile int playback_key = -1;
 volatile int playback_index = 0;
+
+// ==========================================
+// Compose mode
+// ==========================================
+#define MODE_COMPOSE_READY 4
+#define MODE_COMPOSE_PLAYBACK 5
+
+#define MAX_SEQUENCE 32
+int sequence[MAX_SEQUENCE];
+int sequence_length = 0;
+int sequence_index = 0;
+
+// ==========================================
+// Volume mode switch
+// ==========================================
+#define SWITCH_PIN 3
+
+volatile int volume_mode = 0;
+
 // ==========================================
 // DDS ISR
 // ==========================================
@@ -185,7 +205,7 @@ static PT_THREAD(protothread_adc(struct pt* pt)) {
   while (1) {
     // Toggle LED
     gpio_put(LED_PIN, !gpio_get(LED_PIN));
-
+    volume_mode = !gpio_get(SWITCH_PIN);
     // ----------------------------------
     // Read potentiometer
     // ----------------------------------
@@ -195,12 +215,12 @@ static PT_THREAD(protothread_adc(struct pt* pt)) {
     // -> frequency 0-10000 Hz
     current_frequency = (float)adc_val * 10000.0f / 4095.0f;
 
-    // ----------------------------------
-    // Potentiometer controls frequency
-    // except during playback
-    // ----------------------------------
-    if (system_mode == MODE_SYNTH || system_mode == MODE_RECORD_READY ||
-        system_mode == MODE_RECORDING) {
+    if (volume_mode) {
+      mute = 0;
+      target_amplitude = (float)adc_val / 4095.0f;
+      amplitude = target_amplitude;
+    } else if (system_mode == MODE_SYNTH || system_mode == MODE_RECORD_READY ||
+               system_mode == MODE_RECORDING) {
       phase_incr_main = (unsigned int)(current_frequency * two32 / Fs);
     }
 
@@ -315,7 +335,6 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // =========================
           if (system_mode == MODE_RECORD_READY && stored_key >= 1 &&
               stored_key <= 9) {
-
             system_mode = MODE_RECORDING;
             recording_key = stored_key;
             record_index = 0;
@@ -382,11 +401,11 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // -------------------------
           else if (stored_key == 10) {
             if (system_mode == MODE_RECORD_READY) {
-                 system_mode = MODE_SYNTH;
-                 printf("EXIT RECORD MODE\n");
+              system_mode = MODE_SYNTH;
+              printf("EXIT RECORD MODE\n");
             } else {
-                system_mode = MODE_RECORD_READY;
-                printf("RECORD MODE READY\n");
+              system_mode = MODE_RECORD_READY;
+              printf("RECORD MODE READY\n");
             }
           }
 
@@ -395,9 +414,9 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // -------------------------
           else if (system_mode == MODE_RECORDING) {
             if (recording_key >= 1 && recording_key <= 9) {
-                recorded_length[recording_key] = record_index;
-                printf("Finished recording key %d, samples = %d\n",
-                    recording_key, record_index);
+              recorded_length[recording_key] = record_index;
+              printf("Finished recording key %d, samples = %d\n", recording_key,
+                     record_index);
             }
 
             system_mode = MODE_SYNTH;
@@ -415,7 +434,7 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
             // this key has data
             if (recorded_length[stored_key] > 0) {
               playback_key = stored_key;
-              playback_index = 0; 
+              playback_index = 0;
               system_mode = MODE_PLAYBACK;
 
               printf("Start playback key %d\n", playback_key);
@@ -447,7 +466,8 @@ static PT_THREAD(protothread_record(struct pt* pt)) {
   PT_BEGIN(pt);
 
   while (1) {
-    if (system_mode == MODE_RECORDING && recording_key >= 1 && recording_key <= 9) {
+    if (system_mode == MODE_RECORDING && recording_key >= 1 &&
+        recording_key <= 9) {
       if (record_index < MAX_RECORD_SAMPLES) {
         recorded_frequency[recording_key][record_index] = current_frequency;
 
@@ -475,15 +495,13 @@ static PT_THREAD(protothread_playback(struct pt* pt)) {
   PT_BEGIN(pt);
 
   static float playback_frequency;
-  
 
   while (1) {
     // ==================================
     // Start playback
     // ==================================
-    if (system_mode == MODE_PLAYBACK && playback_key >= 1 && playback_key <= 9) {
-      
-
+    if (system_mode == MODE_PLAYBACK && playback_key >= 1 &&
+        playback_key <= 9) {
       if (playback_index < recorded_length[playback_key]) {
         // Read recorded frequency
         playback_frequency = recorded_frequency[playback_key][playback_index];
@@ -492,13 +510,12 @@ static PT_THREAD(protothread_playback(struct pt* pt)) {
         // into DDS phase increment
         phase_incr_main = (unsigned int)(playback_frequency * two32 / Fs);
 
-        playback_index++;
+        playback_index += PLAYBACK_SPEED;
       } else {
         // Finished playback
         system_mode = MODE_SYNTH;
         printf("Playback finished: key %d\n", playback_key);
         playback_key = -1;
-
       }
     }
 
@@ -549,6 +566,10 @@ int main() {
   gpio_set_dir(ISR_GPIO, GPIO_OUT);
   gpio_put(ISR_GPIO, 0);
 
+  gpio_init(SWITCH_PIN);
+  gpio_set_dir(SWITCH_PIN, GPIO_IN);
+  gpio_pull_up(SWITCH_PIN);
+
   // ======================================
   // Keypad setup
   // ======================================
@@ -569,8 +590,7 @@ int main() {
   gpio_set_dir_out_masked(0xF << BASE_KEYPAD_PIN);
 
   // Default all rows HIGH
-  gpio_put_masked(0xF << BASE_KEYPAD_PIN,
-                  0xF << BASE_KEYPAD_PIN);
+  gpio_put_masked(0xF << BASE_KEYPAD_PIN, 0xF << BASE_KEYPAD_PIN);
 
   // Column pull-ups
   gpio_pull_up(BASE_KEYPAD_PIN + 4);
