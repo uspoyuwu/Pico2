@@ -139,7 +139,7 @@ volatile int record_index = 0;
 // Playback
 // ==========================================
 volatile int playback_key = -1;
-
+volatile int playback_index = 0;
 // ==========================================
 // DDS ISR
 // ==========================================
@@ -319,7 +319,7 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
             system_mode = MODE_RECORDING;
             recording_key = stored_key;
             record_index = 0;
-            
+
             printf("Start recording key %d\n", recording_key);
           }
         } else {
@@ -381,20 +381,24 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // key index 10 = *
           // -------------------------
           else if (stored_key == 10) {
-            system_mode = MODE_RECORD_READY;
-
-            printf("RECORD MODE READY\n");
+            if (system_mode == MODE_RECORD_READY) {
+                 system_mode = MODE_SYNTH;
+                 printf("EXIT RECORD MODE\n");
+            } else {
+                system_mode = MODE_RECORD_READY;
+                printf("RECORD MODE READY\n");
+            }
           }
 
           // -------------------------
           // Finished recording
           // -------------------------
-          else if (system_mode == MODE_RECORDING &&
-                   stored_key == recording_key) {
-            recorded_length[recording_key] = record_index;
-
-            printf("Finished recording key %d, samples = %d\n", recording_key,
-                   record_index);
+          else if (system_mode == MODE_RECORDING) {
+            if (recording_key >= 1 && recording_key <= 9) {
+                recorded_length[recording_key] = record_index;
+                printf("Finished recording key %d, samples = %d\n",
+                    recording_key, record_index);
+            }
 
             system_mode = MODE_SYNTH;
 
@@ -411,7 +415,7 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
             // this key has data
             if (recorded_length[stored_key] > 0) {
               playback_key = stored_key;
-
+              playback_index = 0; 
               system_mode = MODE_PLAYBACK;
 
               printf("Start playback key %d\n", playback_key);
@@ -443,11 +447,16 @@ static PT_THREAD(protothread_record(struct pt* pt)) {
   PT_BEGIN(pt);
 
   while (1) {
-    if (system_mode == MODE_RECORDING) {
+    if (system_mode == MODE_RECORDING && recording_key >= 1 && recording_key <= 9) {
       if (record_index < MAX_RECORD_SAMPLES) {
         recorded_frequency[recording_key][record_index] = current_frequency;
 
         record_index++;
+      } else {
+        recorded_length[recording_key] = MAX_RECORD_SAMPLES;
+        system_mode = MODE_SYNTH;
+        recording_key = -1;
+        printf("Recording buffer full\n");
       }
     }
 
@@ -465,17 +474,17 @@ static PT_THREAD(protothread_record(struct pt* pt)) {
 static PT_THREAD(protothread_playback(struct pt* pt)) {
   PT_BEGIN(pt);
 
-  static int playback_index;
   static float playback_frequency;
+  
 
   while (1) {
     // ==================================
     // Start playback
     // ==================================
-    if (system_mode == MODE_PLAYBACK) {
-      playback_index = 0;
+    if (system_mode == MODE_PLAYBACK && playback_key >= 1 && playback_key <= 9) {
+      
 
-      while (playback_index < recorded_length[playback_key]) {
+      if (playback_index < recorded_length[playback_key]) {
         // Read recorded frequency
         playback_frequency = recorded_frequency[playback_key][playback_index];
 
@@ -484,21 +493,16 @@ static PT_THREAD(protothread_playback(struct pt* pt)) {
         phase_incr_main = (unsigned int)(playback_frequency * two32 / Fs);
 
         playback_index++;
+      } else {
+        // Finished playback
+        system_mode = MODE_SYNTH;
+        printf("Playback finished: key %d\n", playback_key);
+        playback_key = -1;
 
-        // Playback at same 100 Hz
-        // rate used when recording
-        PT_YIELD_usec(10000);
       }
-
-      printf("Playback finished: key %d\n", playback_key);
-
-      // Return to normal synth
-      system_mode = MODE_SYNTH;
-
-      playback_key = -1;
     }
 
-    PT_YIELD_usec(1000);
+    PT_YIELD_usec(10000);
   }
 
   PT_END(pt);
