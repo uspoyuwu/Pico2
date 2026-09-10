@@ -293,7 +293,6 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
 
         if (i != -1) {
           stored_key = i;
-
           debounce_state = MAYBE_PRESSED;
         }
 
@@ -307,7 +306,6 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
         if (i == stored_key) {
           // Confirmed press
           debounce_state = PRESSED;
-
           printf("Key %d pressed\n", stored_key);
 
           // =========================
@@ -317,12 +315,11 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // =========================
           if (system_mode == MODE_RECORD_READY && stored_key >= 1 &&
               stored_key <= 9) {
+
             system_mode = MODE_RECORDING;
-
             recording_key = stored_key;
-
             record_index = 0;
-
+            
             printf("Start recording key %d\n", recording_key);
           }
         } else {
@@ -515,49 +512,37 @@ int main() {
   // stdio
   // --------------------------------------
   stdio_init_all();
-
   printf("ADC + Keypad DDS Synth\n");
 
   // ======================================
   // ADC setup
   // ======================================
   adc_init();
-
   adc_gpio_init(ADC_PIN);
-
   adc_select_input(ADC_MUX);
 
   // ======================================
   // SPI setup
   // ======================================
   spi_init(SPI_PORT, 20000000);
-
   spi_set_format(SPI_PORT, 16, 0, 0, 0);
-
   gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-
   gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-
   gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-
   gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
 
   // ======================================
   // LED
   // ======================================
   gpio_init(LED_PIN);
-
   gpio_set_dir(LED_PIN, GPIO_OUT);
-
   gpio_put(LED_PIN, true);
 
   // ======================================
   // ISR timing GPIO
   // ======================================
   gpio_init(ISR_GPIO);
-
   gpio_set_dir(ISR_GPIO, GPIO_OUT);
-
   gpio_put(ISR_GPIO, 0);
 
   // ======================================
@@ -571,9 +556,7 @@ int main() {
   // GPIO 13, 14, 15
   // inputs
   gpio_set_dir(BASE_KEYPAD_PIN + 4, GPIO_IN);
-
   gpio_set_dir(BASE_KEYPAD_PIN + 5, GPIO_IN);
-
   gpio_set_dir(BASE_KEYPAD_PIN + 6, GPIO_IN);
 
   // Row pins:
@@ -583,14 +566,11 @@ int main() {
 
   // Default all rows HIGH
   gpio_put_masked(0xF << BASE_KEYPAD_PIN,
-
                   0xF << BASE_KEYPAD_PIN);
 
   // Column pull-ups
   gpio_pull_up(BASE_KEYPAD_PIN + 4);
-
   gpio_pull_up(BASE_KEYPAD_PIN + 5);
-
   gpio_pull_up(BASE_KEYPAD_PIN + 6);
 
   // ======================================
@@ -605,22 +585,16 @@ int main() {
   // Timer interrupt
   // ======================================
   hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
-
   irq_set_exclusive_handler(ALARM_IRQ, alarm_irq);
-
   irq_set_enabled(ALARM_IRQ, true);
-
   timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
   // ======================================
   // Protothreads
   // ======================================
   pt_add_thread(protothread_adc);
-
   pt_add_thread(protothread_keypad);
-
   pt_add_thread(protothread_record);
-
   pt_add_thread(protothread_playback);
 
   // Start scheduler
