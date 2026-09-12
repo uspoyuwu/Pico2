@@ -155,7 +155,7 @@ volatile int record_index = 0;
 // ============================================================
 // playback_index is global because the keypad thread resets it when a
 // playback starts, while the playback thread advances it.
-#define PLAYBACK_SPEED 1
+#define PLAYBACK_SPEED 6
 
 volatile int playback_key = -1;
 volatile int playback_index = 0;
@@ -243,7 +243,7 @@ static PT_THREAD(protothread_adc(struct pt* pt)) {
     printf("ADC: %u, Frequency: %.2f Hz, Amp: %.2f, Mode: %d\n", adc_val,
            current_frequency, amplitude, system_mode);
 
-    PT_YIELD_usec(20000);
+    PT_YIELD_usec(8000);
   }
 
   PT_END(pt);
@@ -370,14 +370,21 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // ----- #: compose mode -----
           else if (stored_key == 11) {
             if (system_mode == MODE_COMPOSE_READY) {
-              system_mode = MODE_COMPOSE_PLAYBACK;
-              sequence_index = 0;
-
-              printf("Sequence (%d): ", sequence_length);
-              for (int k = 0; k < sequence_length; k++) {
-                printf("%d ", sequence[k]);
+              if (sequence_length > 0) {
+                system_mode = MODE_COMPOSE_PLAYBACK;
+                sequence_index = 0;
+                playback_key = sequence[0];
+                playback_index = 0;
+                printf("Sequence (%d): ", sequence_length);
+                for (int k = 0; k < sequence_length; k++) {
+                  printf("%d ", sequence[k]);
+                }
+                printf("\n");
+              } else {
+                system_mode = MODE_SYNTH;
+                printf("Sequence is empty\n");
               }
-              printf("\n");
+
             } else if (system_mode == MODE_COMPOSE_PLAYBACK) {
               system_mode = MODE_SYNTH;
               printf("COMPOSE PLAYBACK ABORTED\n");
@@ -487,17 +494,31 @@ static PT_THREAD(protothread_playback(struct pt* pt)) {
   static float playback_frequency;
 
   while (1) {
-    if (system_mode == MODE_PLAYBACK && playback_key >= 1 &&
-        playback_key <= 9) {
+    if ((system_mode == MODE_PLAYBACK ||
+         system_mode == MODE_COMPOSE_PLAYBACK) &&
+        playback_key >= 1 && playback_key <= 9) {
       if (playback_index < recorded_length[playback_key]) {
         playback_frequency = recorded_frequency[playback_key][playback_index];
         phase_incr_main = (unsigned int)(playback_frequency * two32 / Fs);
 
         playback_index += PLAYBACK_SPEED;
       } else {
-        system_mode = MODE_SYNTH;
-        printf("Playback finished: key %d\n", playback_key);
-        playback_key = -1;
+        if (system_mode == MODE_COMPOSE_PLAYBACK) {
+          sequence_index++;
+
+          if (sequence_index < sequence_length) {
+            playback_key = sequence[sequence_index];
+            playback_index = 0;
+          } else {
+            system_mode = MODE_SYNTH;
+            playback_key = -1;
+            printf("Sequence finished\n");
+          }
+        } else {
+          system_mode = MODE_SYNTH;
+          printf("Playback finished: key %d\n", playback_key);
+          playback_key = -1;
+        }
       }
     }
 
