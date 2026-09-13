@@ -16,7 +16,7 @@
  * Timing
  *   synthesis ISR  50 kHz   (GPIO 2 is asserted for the duration)
  *   record/playback 100 Hz
- *   ADC thread      50 Hz
+ *   ADC thread      100 Hz
  *   keypad thread   33 Hz
  */
 
@@ -153,9 +153,12 @@ volatile int record_index = 0;
 // ============================================================
 // Playback
 // ============================================================
+// Skipping PLAYBACK_SPEED samples per pass compresses playback by that
+// factor. The lab requires 8-10x so that hand-speed slider sweeps come
+// out at birdsong speed.
 // playback_index is global because the keypad thread resets it when a
 // playback starts, while the playback thread advances it.
-#define PLAYBACK_SPEED 6
+#define PLAYBACK_SPEED 8
 
 volatile int playback_key = -1;
 volatile int playback_index = 0;
@@ -199,12 +202,20 @@ static void alarm_irq(void) {
 }
 
 // ============================================================
-// ADC thread -- 50 Hz
+// ADC thread -- 100 Hz
 // ============================================================
+// Matched to the record and playback threads so the whole chain shares
+// one time base: the frequency this thread computes is what the record
+// thread samples.
 static PT_THREAD(protothread_adc(struct pt* pt)) {
   PT_BEGIN(pt);
 
   static unsigned int adc_val;
+
+  // The thread runs faster than the serial port can keep up with, so the
+  // status line is printed only every PRINT_EVERY passes.
+  static int print_counter = 0;
+  const int PRINT_EVERY = 10;  // 10 lines per second
 
   while (1) {
     gpio_put(LED_PIN, !gpio_get(LED_PIN));
@@ -240,10 +251,14 @@ static PT_THREAD(protothread_adc(struct pt* pt)) {
       }
     }
 
-    printf("ADC: %u, Frequency: %.2f Hz, Amp: %.2f, Mode: %d\n", adc_val,
-           current_frequency, amplitude, system_mode);
+    print_counter++;
+    if (print_counter >= PRINT_EVERY) {
+      printf("ADC: %u, Frequency: %.2f Hz, Amp: %.2f, Mode: %d\n", adc_val,
+             current_frequency, amplitude, system_mode);
+      print_counter = 0;
+    }
 
-    PT_YIELD_usec(8000);
+    PT_YIELD_usec(10000);
   }
 
   PT_END(pt);
@@ -343,8 +358,28 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           // ====================================================
           printf("Key %d released\n", stored_key);
 
+          // ----- any release ends a recording -----
+          // Checked first so that pressing * or # mid-recording still
+          // closes the recording cleanly, instead of falling into a
+          // mode-toggle branch and silently discarding it. Not checking
+          // stored_key == recording_key either: brushing a second key
+          // would otherwise strand system_mode in MODE_RECORDING with no
+          // way out.
+          if (system_mode == MODE_RECORDING) {
+            if (recording_key >= 1 && recording_key <= 9) {
+              recorded_length[recording_key] = record_index;
+              printf("Finished recording key %d, samples = %d\n", recording_key,
+                     record_index);
+            }
+
+            // Outside the guard, so a bad key index can't trap us here.
+            system_mode = MODE_SYNTH;
+            recording_key = -1;
+            record_index = 0;
+          }
+
           // ----- 0: mute -----
-          if (stored_key == 0) {
+          else if (stored_key == 0) {
             mute = !mute;
 
             if (mute) {
@@ -357,8 +392,13 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           }
 
           // ----- *: record mode -----
+          // Ignored while composing so a stray press can't discard the
+          // sequence the user has been building.
           else if (stored_key == 10) {
-            if (system_mode == MODE_RECORD_READY) {
+            if (system_mode == MODE_COMPOSE_READY ||
+                system_mode == MODE_COMPOSE_PLAYBACK) {
+              printf("Ignored: in compose mode\n");
+            } else if (system_mode == MODE_RECORD_READY) {
               system_mode = MODE_SYNTH;
               printf("EXIT RECORD MODE\n");
             } else {
@@ -368,8 +408,12 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
           }
 
           // ----- #: compose mode -----
+          // Ignored while in record mode, mirroring how * is ignored while
+          // composing: the two modes shouldn't clobber each other.
           else if (stored_key == 11) {
-            if (system_mode == MODE_COMPOSE_READY) {
+            if (system_mode == MODE_RECORD_READY) {
+              printf("Ignored: in record mode\n");
+            } else if (system_mode == MODE_COMPOSE_READY) {
               if (sequence_length > 0) {
                 system_mode = MODE_COMPOSE_PLAYBACK;
                 sequence_index = 0;
@@ -393,23 +437,6 @@ static PT_THREAD(protothread_keypad(struct pt* pt)) {
               sequence_length = 0;
               printf("COMPOSE MODE READY\n");
             }
-          }
-
-          // ----- any release ends a recording -----
-          // Deliberately not checking stored_key == recording_key:
-          // brushing a second key mid-recording would otherwise strand
-          // system_mode in MODE_RECORDING with no way out.
-          else if (system_mode == MODE_RECORDING) {
-            if (recording_key >= 1 && recording_key <= 9) {
-              recorded_length[recording_key] = record_index;
-              printf("Finished recording key %d, samples = %d\n", recording_key,
-                     record_index);
-            }
-
-            // Outside the guard, so a bad key index can't trap us here.
-            system_mode = MODE_SYNTH;
-            recording_key = -1;
-            record_index = 0;
           }
 
           // ----- 1-9 while composing: append to the sequence -----
@@ -504,6 +531,8 @@ static PT_THREAD(protothread_playback(struct pt* pt)) {
         playback_index += PLAYBACK_SPEED;
       } else {
         if (system_mode == MODE_COMPOSE_PLAYBACK) {
+          // Chain straight into the next key rather than returning to
+          // MODE_SYNTH, so the sequence plays as one continuous phrase.
           sequence_index++;
 
           if (sequence_index < sequence_length) {
