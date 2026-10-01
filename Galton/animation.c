@@ -514,9 +514,8 @@ static void drawPegs(void) {
 
 static void drawBalls(void) {
   for (int i = 0; i < ball_count; i++) {
-    fillRect(fix2int15(balls[i].x) - BALL_RADIUS,
-             fix2int15(balls[i].y) - BALL_RADIUS, BALL_RADIUS * 2,
-             BALL_RADIUS * 2, DISPLAY_COLOUR);
+    fillCircle(fix2int15(balls[i].x), fix2int15(balls[i].y), BALL_RADIUS,
+               DISPLAY_COLOUR);
   }
 }
 
