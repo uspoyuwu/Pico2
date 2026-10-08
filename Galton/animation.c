@@ -103,7 +103,7 @@ typedef signed int fix15;
 //
 // Step up gradually and watch the screen: 150 (known good), then 200, then
 // 250. 300 has run but grew unstable after twenty or thirty seconds.
-#define SYS_CLOCK_KHZ 250000
+#define SYS_CLOCK_KHZ 300000
 
 // ================================================================
 // === Board geometry and parameters
@@ -145,7 +145,7 @@ typedef signed int fix15;
 //
 // The hard ceiling is memory: two VGA buffers take 307 KB of the 520 KB of
 // SRAM, leaving about 211 KB, and at 10 bytes a ball that is roughly 21,600.
-#define MAX_BALLS 17500
+#define MAX_BALLS 20500
 #define INITIAL_BALLS 5000
 
 #define MIN_BOUNCINESS float2fix15(0.05f)
