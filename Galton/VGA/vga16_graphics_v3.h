@@ -15,19 +15,35 @@
  *
  * RESOURCES USED
  *  - PIO state machines 0, 1, and 2 on PIO instance 0
- *  - 4 DMA channels 
- *  - 2 x 153.6 kBytes of RAM (for doublebuffer pixel color data)
+ *  - 4 DMA channels
+ *  - 2 x 38.4 kBytes of RAM (for doublebuffer pixel data, 1 bit per pixel)
  *
+ * ONE BIT PER PIXEL, MONOCHROME.
+ *
+ * Eight pixels to a byte rather than two, so each buffer is 38,400 bytes
+ * instead of 153,600 and the pair costs 75 KB instead of 300 KB. One bit
+ * cannot drive four colour pins, so rgb.pio narrows its OUT group to a
+ * single pin and the picture is that colour on black; see rgb.pio for
+ * which pin and how to change it.
+ *
+ * Any non-zero colour lights a pixel and zero clears it, so existing calls
+ * still compile and still mean the right thing. The enum below is kept so
+ * that old code builds, but only BLACK is distinguishable from the rest.
+ *
+ * Two call-level changes:
+ *   clearRect  x1 and x2 must now be multiples of EIGHT, not two.
+ *   readPixel  returns 0 or 1, not a colour index.
  */
 
 
 // Give the I/O pins that we're using some names that make sense - usable in main()
  enum vga_pins {HSYNC=16, VSYNC, LO_GRN, HI_GRN, BLUE_PIN, RED_PIN} ;
 
-// We can only produce 16 (4-bit) colors, so let's give them readable names - usable in main()
+// Kept so that code written against the 16 colour driver still compiles.
+// On screen only BLACK and not-BLACK can be told apart.
 enum colors {BLACK, DARK_GREEN, MED_GREEN, GREEN,
             DARK_BLUE, BLUE, LIGHT_BLUE, CYAN,
-            RED, DARK_ORANGE, ORANGE, YELLOW, 
+            RED, DARK_ORANGE, ORANGE, YELLOW,
             MAGENTA, PINK, LIGHT_PINK, WHITE} ;
 
 // Augmentations
@@ -75,7 +91,7 @@ int drawTextGrotesk32(short x, short y, char * str, char color, char bgcolor) ;
 //
 // ====================
 // specialized clear routines
-// fast clear -- x1 and x2 must be EVEN numbered pixels
+// fast clear -- x1 and x2 must be MULTIPLES OF EIGHT at 1 bit per pixel
 void clearRect(short x1, short y1, short x2, short y2, short c) ;
 // clears the whole frame below top value to a color
 void clearLowFrame(short, short) ;

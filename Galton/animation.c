@@ -143,9 +143,15 @@ typedef signed int fix15;
 // same model scales by 150/200 and predicts about 13,200, so this has to
 // be above that.
 //
-// The hard ceiling is memory: two VGA buffers take 307 KB of the 520 KB of
-// SRAM, leaving about 211 KB, and at 10 bytes a ball that is roughly 21,600.
-#define MAX_BALLS 20500
+// The hard ceiling is memory. At one bit a pixel the two VGA buffers take
+// 75 KB of the 520 KB of SRAM instead of 300 KB, leaving about 445 KB, and
+// at 10 bytes a ball that is roughly 44,000. The processor lands in the same
+// place: 0.284 us a ball for the physics plus about 0.083 for drawing one at
+// a bit a pixel puts the deadline at a little over 44,000 as well.
+//
+// If the link fails with "region RAM overflowed by N bytes", lower this by
+// N/10 and rebuild.
+#define MAX_BALLS 43000
 #define INITIAL_BALLS 1000
 
 #define MIN_BOUNCINESS float2fix15(0.05f)
@@ -727,7 +733,7 @@ static void applyEncoderSteps(int32_t steps) {
       // can be walked up to the deadline a ball at a time.
       int step_size = 1;
       if (ball_count >= 12500) {
-        step_size = 10;
+        step_size = 50;
       } else if (ball_count >= 500) {
         step_size = 50;
       } else if (ball_count >= 100) {
@@ -798,14 +804,18 @@ static void pollUserControls(void) {
 // every frame; the driver exports it, so nothing in the driver changes.
 extern char* current_draw_buffer;
 
+// Bytes per scan line. One bit a pixel, so 640 / 8.
+#define ROW_BYTES 80
+
 // Write one pixel, with no range check. Everything that calls this knows
 // its coordinates are on screen.
 static inline void putPixel(char* row_base, int x, char color) {
-  char* b = row_base + (x >> 1);
-  if (x & 1) {
-    *b = (char)((*b & 0x0f) | (color << 4));
+  unsigned char* b = (unsigned char*)row_base + (x >> 3);
+  unsigned char m = (unsigned char)(1u << (x & 7));
+  if (color) {
+    *b |= m;
   } else {
-    *b = (char)((*b & 0xf0) | color);
+    *b &= (unsigned char)~m;
   }
 }
 
@@ -823,7 +833,7 @@ static const signed char peg_ring[38][2] = {
 
 static inline void drawPeg(int cx, int cy, char color) {
   for (int k = 0; k < 38; k++) {
-    char* row = current_draw_buffer + 320 * (cy + peg_ring[k][1]);
+    char* row = current_draw_buffer + ROW_BYTES * (cy + peg_ring[k][1]);
     putPixel(row, cx + peg_ring[k][0], color);
   }
 }
@@ -850,38 +860,42 @@ static void drawPegs(void) {
 //     ####
 //     .##.
 //
-// Two pixels share a byte in this 4 bpp buffer. Snapping the centre to
-// an even column makes each 4-pixel row two whole bytes, which can be
-// stored outright; only the 2-pixel top and bottom rows straddle a byte
-// pair and need read-modify-write. The snap moves a ball by at most one
-// pixel, which is invisible at this size.
+// Eight pixels share a byte in this 1 bpp buffer, so the ball is four bits
+// wide and lands anywhere inside a byte, crossing into the next one at most
+// once. Both rows are therefore built as one shifted mask and folded into
+// two bytes. There is no read-modify-write to avoid any more: the whole
+// frame is cleared to black first, so lighting a pixel is an OR.
 static inline void drawBall(int cx, int cy, char color) {
   // Nothing here range-checks per pixel, so reject anything near an edge
   // before writing. Balls live in the middle of the screen anyway.
-  if (cx < 2 || cx > 636 || cy < 2 || cy > 477) return;
+  if (cx < 4 || cx > 634 || cy < 2 || cy > 477) return;
 
-  cx &= ~1;
+  // Snapping the left edge to a multiple of four keeps all four pixels of a
+  // row inside one byte, so each row is a single read-modify-write and the
+  // masks are two constants rather than a shift. Snapping to two instead
+  // would straddle a byte boundary a quarter of the time and cost ten
+  // accesses a ball rather than five. The extra snap moves a ball by at most
+  // three pixels, which nothing can see at this size.
+  cx &= ~3;
 
-  char both = (char)(color | (color << 4));
-  char* p = current_draw_buffer + 320 * cy + (cx >> 1);
+  unsigned char* p =
+      (unsigned char*)current_draw_buffer + ROW_BYTES * cy + (cx >> 3);
+  unsigned char w = (cx & 4) ? 0xf0u : 0x0fu;  // ####
+  unsigned char n = (cx & 4) ? 0x60u : 0x06u;  // .##.
 
-  // The three 4-pixel rows: two whole bytes each
-  *(p - 321) = both;
-  *(p - 320) = both;
-  *(p - 1) = both;
-  *(p) = both;
-  *(p + 319) = both;
-  *(p + 320) = both;
-
-  // Top row: pixel cx-1 is the high nibble of the byte before, pixel cx
-  // is the low nibble of this one.
-  char* top = p - 640;
-  *(top - 1) = (char)((*(top - 1) & 0x0f) | (color << 4));
-  *(top) = (char)((*(top) & 0xf0) | color);
-
-  char* bottom = p + 640;
-  *(bottom - 1) = (char)((*(bottom - 1) & 0x0f) | (color << 4));
-  *(bottom) = (char)((*(bottom) & 0xf0) | color);
+  if (color) {
+    p[-2 * ROW_BYTES] |= n;
+    p[-ROW_BYTES] |= w;
+    p[0] |= w;
+    p[ROW_BYTES] |= w;
+    p[2 * ROW_BYTES] |= n;
+  } else {
+    p[-2 * ROW_BYTES] &= (unsigned char)~n;
+    p[-ROW_BYTES] &= (unsigned char)~w;
+    p[0] &= (unsigned char)~w;
+    p[ROW_BYTES] &= (unsigned char)~w;
+    p[2 * ROW_BYTES] &= (unsigned char)~n;
+  }
 }
 
 static void drawBalls(void) {

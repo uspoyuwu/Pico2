@@ -2,46 +2,72 @@
 ; Hunter Adams (vha3@cornell.edu)
 ; RGB generation for VGA driver
 ; mod by Bruce Land for 16 colors
+; mod again for 1 bit per pixel, monochrome
+;
+; ONE BIT PER PIXEL.
+;
+; The 16 colour version shifted out four bits a pixel, one to each of the four
+; colour pins, so 1111 was white. One bit cannot drive four pins, so the OUT
+; group is narrowed to a single colour pin and the picture becomes that colour
+; on black. The other three pins are still in the SET group and are held at
+; zero through blanking, so they never light.
+;
+; The frame buffer therefore holds eight pixels per byte instead of two, and
+; shrinks from 153,600 bytes to 38,400. Shifting is to the right, so bit 0 of
+; a byte is its leftmost pixel, matching the old layout where the low nibble
+; was the left pixel of the pair.
+;
+; Autopull refills the OSR every 8 bits, so the loop needs no pull and costs
+; two instructions. One pixel must take N cycles, where N = sys_clock / 25 MHz:
+;
+;     1 + pixelhold  (out)  +  1  (jmp)  =  N      ->  pixelhold = N - 2
+;
+;   150 MHz  N=6    pixelhold 4
+;   200 MHz  N=8    pixelhold 6
+;   250 MHz  N=10   pixelhold 8
+;   300 MHz  N=12   pixelhold 10    <-- set below
+;
+; hsync.pio and vsync.pio are unchanged: the pixel clock is still 25 MHz, so
+; the sync timing they produce is exactly as before.
 
-; Program name
 .program rgb
-; define the pixel hold times which depend on clock freq
-; pixel1hold should be 5 for 150 MHz  (4 for 125 MHz)
-; pixel2hold should be 3 for 150 MHz  (2 for 125 MHz)
-.define pixel1hold 11
-.define pixel2hold 9
+.define pixelhold 10
 .define PUBLIC vid_freq 300
 
 pull block 					; Pull from FIFO to OSR (only once)
 mov y, osr 					; Copy value from OSR to y scratch register
 .wrap_target
 
-set pins, 0 				; Zero RGB pins in blanking
+set pins, 0 				; Zero all four colour pins in blanking
 mov x, y 					; Initialize counter variable
 
 wait 1 irq 1 [3]			; Wait for vsync active mode (starts 5 cycles after execution)
 
 colorout:
-	pull block				; Pull color value
-	out pins, 4	[pixel1hold]	; Push out to pins (first pixel)
-	out pins, 4	[pixel2hold]	; Push out to pins (next pixel)
+	out pins, 1	[pixelhold]	; One pixel, one bit; autopull refills every 8
 	jmp x-- colorout		; Stay here thru horizontal active mode
 
 .wrap
 
 % c-sdk {
+// Which of the four colour pins carries the picture, counted from the base
+// pin passed in (LO_GRN). 0 green-lo (470 ohm, dim), 1 green-hi, 2 blue,
+// 3 red. Green-hi and red sit behind 330 ohm and are the bright ones.
+#define RGB_MONO_PIN_OFFSET 3
+
 static inline void rgb_program_init(PIO pio, uint sm, uint offset, uint pin) {
 
-    // creates state machine configuration object c, sets
-    // to default configurations. I believe this function is auto-generated
-    // and gets a name of <program name>_program_get_default_config
-    // Yes, page 40 of SDK guide
     pio_sm_config c = rgb_program_get_default_config(offset);
 
-    // Map the state machine's SET and OUT pin group to three pins, the `pin`
-    // parameter to this function is the lowest one. These groups overlap.
+    // SET still covers all four colour pins so that blanking can drive every
+    // one of them low. OUT covers only the single pin that carries pixels.
     sm_config_set_set_pins(&c, pin, 4);
-    sm_config_set_out_pins(&c, pin, 4);
+    sm_config_set_out_pins(&c, pin + RGB_MONO_PIN_OFFSET, 1);
+
+    // Shift right, autopull, refill after 8 bits. Right shift makes bit 0 the
+    // leftmost pixel of each byte. Autopull is what keeps the inner loop at
+    // two instructions.
+    sm_config_set_out_shift(&c, true, true, 8);
 
     // Set clock division (Commented out, this one runs at full speed)
     // sm_config_set_clkdiv(&c, 5) ;
@@ -54,8 +80,8 @@ static inline void rgb_program_init(PIO pio, uint sm, uint offset, uint pin) {
     pio_gpio_init(pio, pin+1);
     pio_gpio_init(pio, pin+2);
     pio_gpio_init(pio, pin+3);
-    
-    // Set the pin direction to output at the PIO (3 pins)
+
+    // Set the pin direction to output at the PIO (4 pins)
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 4, true);
 
     // Load our configuration, and jump to the start of the program
