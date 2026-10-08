@@ -139,7 +139,24 @@ typedef signed int fix15;
 #define GRAVITY_STEP float2fix15(0.05f)
 #define MAX_HORIZONTAL_SPEED float2fix15(3.5f)
 
-#define FRAME_BUDGET_US 16667
+// One frame of the driver's own timing, not the VGA spec's.
+//
+// vsync.pio counts 524 lines, not the spec's 525 (the 33rd back-porch
+// line was cut to fit the 32-instruction block), and the pixel clock is
+// 150 MHz / 6 = 25.000 MHz, not the spec's 25.175 MHz. So one pixel is
+// 40 ns exactly and one frame is
+//
+//     524 lines * 800 clocks * 40 ns = 16,768 us   (59.64 Hz)
+//
+// The old 16,667 came from assuming 60.00 Hz. It threw away 101 us a
+// frame -- about 58 balls' worth of work -- and reported misses that
+// were not misses.
+#define FRAME_BUDGET_US 16768
+
+// A deadline miss lasts one frame, so a one-frame LED pulse is 1/60 s
+// and invisible. Hold it lit for 20 frames (about a third of a second)
+// so it can actually be seen at check-off.
+#define LED_HOLD_FRAMES 20
 #define DISPLAY_COLOUR WHITE
 
 // Balls are stored packed and worked on unpacked.
@@ -207,6 +224,19 @@ typedef struct {
 static Ball balls[MAX_BALLS];
 static Peg pegs[NUM_PEGS];
 static int row_start[NUM_ROWS];
+
+// The x of the leftmost peg in each row.
+//
+// findCollidingPeg used to recompute BOARD_CENTER_X - (row*PEG_SPACING)/2
+// for each of the three rows it checks, so three multiplies and three
+// divides per ball per frame -- over 28,000 of each at 9,450 balls. The
+// value never changes after initPegs, so it is computed once there.
+static int row_left[NUM_ROWS];
+
+// Set whenever a control is touched, so the readout reformats on the very
+// next frame instead of waiting out its refresh interval. Without it a
+// knob turn would look like it had done nothing for up to 200 ms.
+static bool readout_dirty = true;
 
 // Counters are per core.
 //
@@ -405,6 +435,7 @@ static void initPegs(void) {
   int peg_index = 0;
   for (int row = 0; row < NUM_ROWS; row++) {
     int left = BOARD_CENTER_X - (row * PEG_SPACING) / 2;
+    row_left[row] = left;
     row_start[row] = peg_index;
     for (int column = 0; column <= row; column++) {
       Peg *peg = &pegs[peg_index++];
@@ -467,7 +498,7 @@ static int findCollidingPeg(const BallWork *ball) {
   int last_row = clampInt(center_row + 1, 0, NUM_ROWS - 1);
 
   for (int row = first_row; row <= last_row; row++) {
-    int left = BOARD_CENTER_X - (row * PEG_SPACING) / 2;
+    int left = row_left[row];
     int center_column = (ball_x - left) / PEG_SPACING;
     int first_column = clampInt(center_column - 1, 0, row);
     int last_column = clampInt(center_column + 1, 0, row);
@@ -515,7 +546,11 @@ static void reflectFromPeg(BallWork *ball, int peg_index) {
       multfix15(tilted_x, ball->vx) + multfix15(tilted_y, ball->vy);
 
   if (normal_velocity < 0) {
-    fix15 impulse = -multfix15(int2fix15(2), normal_velocity);
+    // Doubling by multiply would be a full 64-bit multfix15 for what the
+    // ALU does in one instruction. Written as * 2 rather than << 1
+    // because normal_velocity is negative in this branch and shifting a
+    // negative left is undefined behaviour.
+    fix15 impulse = -(normal_velocity * 2);
     ball->vx += multfix15(tilted_x, impulse);
     ball->vy += multfix15(tilted_y, impulse);
     ball->vx = multfix15(ball->vx, bounciness);
@@ -704,11 +739,13 @@ static void pollUserControls(void) {
   bool button_down = !gpio_get(ENCODER_BUTTON_PIN);
   if (button_down && !button_was_down) {
     adjust_mode = (AdjustMode)((adjust_mode + 1) % ADJUST_COUNT);
+    readout_dirty = true;
   }
   button_was_down = button_down;
 
   int32_t steps = encoder_steps;
   encoder_steps -= steps;
+  if (steps != 0) readout_dirty = true;
   applyEncoderSteps(steps);
 }
 
@@ -849,43 +886,62 @@ static const char *activeMarker(AdjustMode mode) {
   return adjust_mode == mode ? ">" : " ";
 }
 
+// The readout is rebuilt at about 5 Hz, not every frame.
+//
+// Seven sprintf calls a frame, two of them %.2f, cost more than the
+// physics of a few hundred balls -- printf's float formatter is a
+// library call with its own loop, and there is no hardware for it. None
+// of these numbers is readable faster than a few times a second anyway,
+// so the strings are formatted every READOUT_REFRESH_FRAMES frames and
+// kept in memory.
+//
+// Drawing still happens every frame: clearLowFrame wipes the whole
+// screen, so anything not redrawn disappears. Only the formatting is
+// throttled, not the blitting.
+#define READOUT_LINES 7
+#define READOUT_REFRESH_FRAMES 12
+
+static char readout[READOUT_LINES][80];
+static int readout_age = READOUT_REFRESH_FRAMES;  // force a fill on frame 0
+
 static void drawReadout(uint32_t frame_us, uint32_t missed_frames) {
-  char line[80];
-  uint32_t seconds = to_ms_since_boot(get_absolute_time()) / 1000;
+  if (++readout_age >= READOUT_REFRESH_FRAMES || readout_dirty) {
+    readout_age = 0;
+    readout_dirty = false;
+    uint32_t seconds = to_ms_since_boot(get_absolute_time()) / 1000;
 
-  sprintf(line, "Dropped: %lu   Time: %02lu:%02lu:%02lu",
-          (unsigned long)droppedTotal(), (unsigned long)(seconds / 3600),
-          (unsigned long)((seconds / 60) % 60), (unsigned long)(seconds % 60));
-  drawTextTiny8(8, 8, line, DISPLAY_COLOUR, BLACK);
+    sprintf(readout[0], "Dropped: %lu   Time: %02lu:%02lu:%02lu",
+            (unsigned long)droppedTotal(), (unsigned long)(seconds / 3600),
+            (unsigned long)((seconds / 60) % 60), (unsigned long)(seconds % 60));
 
-  sprintf(line, "%s Balls: %d", activeMarker(ADJUST_BALL_COUNT), ball_count);
-  drawTextTiny8(8, 20, line, DISPLAY_COLOUR, BLACK);
-  sprintf(line, "%s Bounce: %.2f", activeMarker(ADJUST_BOUNCINESS),
-          fix2float15(bounciness));
-  drawTextTiny8(8, 32, line, DISPLAY_COLOUR, BLACK);
-  sprintf(line, "%s Gravity: %.2f", activeMarker(ADJUST_GRAVITY),
-          fix2float15(gravity));
-  drawTextTiny8(8, 44, line, DISPLAY_COLOUR, BLACK);
+    sprintf(readout[1], "%s Balls: %d", activeMarker(ADJUST_BALL_COUNT),
+            ball_count);
+    sprintf(readout[2], "%s Bounce: %.2f", activeMarker(ADJUST_BOUNCINESS),
+            fix2float15(bounciness));
+    sprintf(readout[3], "%s Gravity: %.2f", activeMarker(ADJUST_GRAVITY),
+            fix2float15(gravity));
 
-  sprintf(line, "Frame: %lu us  Misses: %lu", (unsigned long)frame_us,
-          (unsigned long)missed_frames);
-  drawTextTiny8(8, 56, line, DISPLAY_COLOUR, BLACK);
+    sprintf(readout[4], "Frame: %lu us  Misses: %lu", (unsigned long)frame_us,
+            (unsigned long)missed_frames);
 
-  // The breakdown. These lag by one frame, because t_text cannot be known
-  // until this function has finished and the other five were measured
-  // before it started. Nothing here changes fast enough for that to
-  // matter.
-  //
-  // Reading them: Phys and Ball grow with the ball count, the other four
-  // do not. Note the figures at two very different counts and the fixed
-  // cost falls straight out of the difference.
-  sprintf(line, "Phys %lu  Clr %lu  Peg %lu", (unsigned long)t_physics,
-          (unsigned long)t_clear, (unsigned long)t_pegs);
-  drawTextTiny8(8, 68, line, DISPLAY_COLOUR, BLACK);
+    // The breakdown. These lag by one frame, because t_text cannot be
+    // known until this function has finished and the other five were
+    // measured before it started. Nothing here changes fast enough for
+    // that to matter.
+    //
+    // Reading them: Phys and Ball grow with the ball count, the other
+    // four do not. Note the figures at two very different counts and the
+    // fixed cost falls straight out of the difference.
+    sprintf(readout[5], "Phys %lu  Clr %lu  Peg %lu", (unsigned long)t_physics,
+            (unsigned long)t_clear, (unsigned long)t_pegs);
 
-  sprintf(line, "Ball %lu  Hist %lu  Txt %lu", (unsigned long)t_balls,
-          (unsigned long)t_hist, (unsigned long)t_text);
-  drawTextTiny8(8, 80, line, DISPLAY_COLOUR, BLACK);
+    sprintf(readout[6], "Ball %lu  Hist %lu  Txt %lu", (unsigned long)t_balls,
+            (unsigned long)t_hist, (unsigned long)t_text);
+  }
+
+  for (int i = 0; i < READOUT_LINES; i++) {
+    drawTextTiny8(8, 8 + i * 12, readout[i], DISPLAY_COLOUR, BLACK);
+  }
 }
 
 // Draw the frame, timing each phase.
@@ -927,6 +983,7 @@ static PT_THREAD(protothread_anim(struct pt *pt)) {
 
   static uint32_t previous_frame_us = 0;
   static uint32_t missed_frames = 0;
+  static int led_hold = 0;
 
   while (1) {
     PT_YIELD_UNTIL(pt, draw_start_signal());
@@ -944,6 +1001,10 @@ static PT_THREAD(protothread_anim(struct pt *pt)) {
     previous_frame_us = time_us_32() - frame_start;
     if (previous_frame_us > FRAME_BUDGET_US) {
       missed_frames++;
+      led_hold = LED_HOLD_FRAMES;
+    }
+    if (led_hold > 0) {
+      led_hold--;
       gpio_put(DEADLINE_LED_PIN, 1);
     } else {
       gpio_put(DEADLINE_LED_PIN, 0);
@@ -968,6 +1029,9 @@ int main(void) {
 
   // The false means "proceed even if the exact frequency is not
   // achievable", so a bad value degrades rather than hanging at boot.
+  /// 300000
+  /// vreg_set_voltage(VREG_VOLTAGE_1_20);
+  /// vreg_disable_volatage_limits();
   set_sys_clock_khz(SYS_CLOCK_KHZ, false);
 
   stdio_init_all();
