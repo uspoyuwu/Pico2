@@ -12,23 +12,20 @@
  *   Deadline LED: 25
  */
 
-#include "VGA/vga16_graphics_v3.h"
-
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "pico/divider.h"
-#include "pico/multicore.h"
-#include "pico/stdlib.h"
-
+#include "VGA/vga16_graphics_v3.h"
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/vreg.h"
-
+#include "pico/divider.h"
+#include "pico/multicore.h"
+#include "pico/stdlib.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
 // ================================================================
@@ -78,19 +75,35 @@ typedef signed int fix15;
 // and the divider in hsync.pio, vsync.pio and rgb.pio has to be scaled
 // by the same factor.
 //
-// Step this up gradually and watch the screen: 150 (known good), then
-// 200, then 250. Nothing else needs changing -- the audio DMA timer
-// already derives its divider from clock_get_hz, and time_us_32 runs
-// off a separate 1 MHz reference, so the timing figures stay valid.
-// 200 MHz was tried and the monitor lost sync: the driver's PIO state
-// machines take their clock divider from a value fixed for 150 MHz, so
-// raising the system clock raises the pixel clock with it and the signal
-// stops meeting the VGA timing the monitor expects.
+// This driver hard-codes the divider. A first attempt at 200 MHz lost sync
+// for exactly that reason: the pixel clock rose with the system clock and
+// the signal stopped meeting the timing the monitor expects.
 //
-// Making this work means scaling sm_config_set_clkdiv in hsync.pio,
-// vsync.pio and rgb.pio by the same factor -- a change to the supplied
-// driver, not to this file.
-#define SYS_CLOCK_KHZ 150000
+// The fix is to rescale all three state machines by N = sys_clock / 25 MHz
+// at the same time as this line:
+//
+//   hsync.pio, vsync.pio   sm_config_set_clkdiv(&c, N)
+//   rgb.pio                pixel1hold = N - 1,  pixel2hold = N - 3
+//
+//   150 MHz  N=6    clkdiv 6,   holds 5 and 3
+//   200 MHz  N=8    clkdiv 8,   holds 7 and 5
+//   250 MHz  N=10   clkdiv 10,  holds 9 and 7
+//   300 MHz  N=12   clkdiv 12,  holds 11 and 9
+//
+// rgb.pio is not clock divided: it runs at the system clock and spends 2N
+// cycles on each pair of pixels, which is where its two hold values come
+// from. The figures above check out against the values that file already
+// carried for 150 and 125 MHz.
+//
+// FRAME_BUDGET_US does not change. The pixel clock stays at 25 MHz, so a
+// frame is still 16,768 us. Overclocking buys work per frame, not a longer
+// frame. Nothing else needs touching either: the audio DMA timer derives
+// its divider from clock_get_hz, and time_us_32 runs off a separate 1 MHz
+// reference, so every measured figure stays comparable across clocks.
+//
+// Step up gradually and watch the screen: 150 (known good), then 200, then
+// 250. 300 has run but grew unstable after twenty or thirty seconds.
+#define SYS_CLOCK_KHZ 250000
 
 // ================================================================
 // === Board geometry and parameters
@@ -120,16 +133,20 @@ typedef signed int fix15;
 #define HIST_TOP_Y 394
 #define HIST_HEIGHT (HIST_BASE_Y - HIST_TOP_Y)
 
-// Measured at 150 MHz: the deadline is first missed at 9450 balls,
-// against 9475 predicted from the fixed cost and the per-ball cost, so
-// the model holds to a third of a percent. Set just under it.
+// Not a performance figure, just the size of the array. It is set above
+// whatever the processor can sustain so that the knob can be turned past
+// the limit while the limit is being measured; the deadline LED, not this
+// number, says where the real ceiling is.
 //
-// At 20 bytes a ball the RAM ran out at about the same point. Packing
-// the state to 10 bytes moved that limit past 21,000, so the processor
-// is now the only thing stopping this -- raising it further needs a
-// faster clock, and that needs the driver's PIO dividers changed too.
-#define MAX_BALLS 9400
-#define INITIAL_BALLS 300
+// At 150 MHz the measured model was T(N) = 1574 + 1.573 N us, putting the
+// ceiling at 9662 balls and the sustained count at 9500. At 200 MHz the
+// same model scales by 150/200 and predicts about 13,200, so this has to
+// be above that.
+//
+// The hard ceiling is memory: two VGA buffers take 307 KB of the 520 KB of
+// SRAM, leaving about 211 KB, and at 10 bytes a ball that is roughly 21,600.
+#define MAX_BALLS 17500
+#define INITIAL_BALLS 5000
 
 #define MIN_BOUNCINESS float2fix15(0.05f)
 #define MAX_BOUNCINESS float2fix15(0.95f)
@@ -196,7 +213,7 @@ typedef struct {
   int last_peg;
 } BallWork;
 
-static inline void loadBall(const Ball *b, BallWork *w) {
+static inline void loadBall(const Ball* b, BallWork* w) {
   // Multiply rather than shift: left-shifting a negative value is not
   // defined by the standard, and the compiler emits the same shift.
   w->x = (fix15)b->x * (1 << STORE_SHIFT);
@@ -206,7 +223,7 @@ static inline void loadBall(const Ball *b, BallWork *w) {
   w->last_peg = b->last_peg;
 }
 
-static inline void storeBall(const BallWork *w, Ball *b) {
+static inline void storeBall(const BallWork* w, Ball* b) {
   b->x = (int16_t)(w->x >> STORE_SHIFT);
   b->y = (int16_t)(w->y >> STORE_SHIFT);
   b->vx = (int16_t)(w->vx >> STORE_SHIFT);
@@ -252,9 +269,7 @@ static uint32_t binTotal(int bin) {
   return bin_count[0][bin] + bin_count[1][bin];
 }
 
-static uint32_t droppedTotal(void) {
-  return total_fallen[0] + total_fallen[1];
-}
+static uint32_t droppedTotal(void) { return total_fallen[0] + total_fallen[1]; }
 
 static int ball_count = INITIAL_BALLS;
 static fix15 bounciness = float2fix15(0.50f);
@@ -305,7 +320,7 @@ static uint32_t random_state[2] = {0x6d2b79f5u, 0x9e3779b9u};
 
 static uint32_t nextRandom(void) {
   // get_core_num reads one SIO register, a single cycle.
-  uint32_t *s = &random_state[get_core_num()];
+  uint32_t* s = &random_state[get_core_num()];
   *s ^= *s << 13;
   *s ^= *s >> 17;
   *s ^= *s << 5;
@@ -356,15 +371,14 @@ static void initAudio(void) {
   buildThunkSamples();
   audio_dma_channel = dma_claim_unused_channel(true);
 
-  dma_channel_config config =
-      dma_channel_get_default_config(audio_dma_channel);
+  dma_channel_config config = dma_channel_get_default_config(audio_dma_channel);
   channel_config_set_transfer_data_size(&config, DMA_SIZE_16);
   channel_config_set_read_increment(&config, true);
   channel_config_set_write_increment(&config, false);
   channel_config_set_chain_to(&config, audio_dma_channel);
 
-  uint16_t timer_numerator = (uint16_t)(
-      ((uint64_t)AUDIO_SAMPLE_RATE << 16) / clock_get_hz(clk_sys));
+  uint16_t timer_numerator =
+      (uint16_t)(((uint64_t)AUDIO_SAMPLE_RATE << 16) / clock_get_hz(clk_sys));
   dma_timer_set_fraction(AUDIO_DMA_TIMER, timer_numerator, 0xffff);
   channel_config_set_dreq(&config, dma_get_timer_dreq(AUDIO_DMA_TIMER));
 
@@ -417,8 +431,8 @@ static void initEncoder(void) {
   gpio_pull_up(ENCODER_A_PIN);
   gpio_pull_up(ENCODER_B_PIN);
   gpio_pull_up(ENCODER_BUTTON_PIN);
-  gpio_set_irq_enabled_with_callback(ENCODER_A_PIN, GPIO_IRQ_EDGE_FALL,
-                                     true, &encoderInterrupt);
+  gpio_set_irq_enabled_with_callback(ENCODER_A_PIN, GPIO_IRQ_EDGE_FALL, true,
+                                     &encoderInterrupt);
 }
 
 static void initDeadlineLed(void) {
@@ -438,7 +452,7 @@ static void initPegs(void) {
     row_left[row] = left;
     row_start[row] = peg_index;
     for (int column = 0; column <= row; column++) {
-      Peg *peg = &pegs[peg_index++];
+      Peg* peg = &pegs[peg_index++];
       peg->px = left + column * PEG_SPACING;
       peg->py = PEG_TOP_Y + row * ROW_SPACING;
       peg->x = int2fix15(peg->px);
@@ -456,7 +470,7 @@ static fix15 randomHorizontalVelocity(void) {
   return velocity;
 }
 
-static void spawnBall(BallWork *ball) {
+static void spawnBall(BallWork* ball) {
   int horizontal_offset = (int)(nextRandom() % 7) - 3;
   ball->x = int2fix15(SPAWN_X + horizontal_offset);
   ball->y = int2fix15(SPAWN_Y);
@@ -490,7 +504,7 @@ static fix15 clampFix(fix15 value, fix15 low, fix15 high) {
 }
 
 // Check only the nearby 3-by-3 peg neighbourhood, not all 136 pegs.
-static int findCollidingPeg(const BallWork *ball) {
+static int findCollidingPeg(const BallWork* ball) {
   int ball_x = fix2int15(ball->x);
   int ball_y = fix2int15(ball->y);
   int center_row = (ball_y - PEG_TOP_Y) / ROW_SPACING;
@@ -519,12 +533,12 @@ static int findCollidingPeg(const BallWork *ball) {
   return -1;
 }
 
-static void reflectFromPeg(BallWork *ball, int peg_index) {
-  Peg *peg = &pegs[peg_index];
+static void reflectFromPeg(BallWork* ball, int peg_index) {
+  Peg* peg = &pegs[peg_index];
   fix15 dx = ball->x - peg->x;
   fix15 dy = ball->y - peg->y;
-  fix15 distance = float2fix15(sqrtf(fix2float15(
-      multfix15(dx, dx) + multfix15(dy, dy))));
+  fix15 distance =
+      float2fix15(sqrtf(fix2float15(multfix15(dx, dx) + multfix15(dy, dy))));
 
   if (distance == 0) {
     distance = float2fix15(0.001f);
@@ -539,9 +553,9 @@ static void reflectFromPeg(BallWork *ball, int peg_index) {
 
   int tilt_index = nextRandom() & (TILT_TABLE_SIZE - 1);
   fix15 tilted_x = multfix15(normal_x, tilt_cos[tilt_index]) -
-                    multfix15(normal_y, tilt_sin[tilt_index]);
+                   multfix15(normal_y, tilt_sin[tilt_index]);
   fix15 tilted_y = multfix15(normal_x, tilt_sin[tilt_index]) +
-                    multfix15(normal_y, tilt_cos[tilt_index]);
+                   multfix15(normal_y, tilt_cos[tilt_index]);
   fix15 normal_velocity =
       multfix15(tilted_x, ball->vx) + multfix15(tilted_y, ball->vy);
 
@@ -563,7 +577,7 @@ static void reflectFromPeg(BallWork *ball, int peg_index) {
   }
 }
 
-static void bounceFromWalls(BallWork *ball) {
+static void bounceFromWalls(BallWork* ball) {
   if (ball->y < int2fix15(ARENA_TOP)) {
     ball->y = int2fix15(ARENA_TOP);
     ball->vy = -ball->vy;
@@ -579,7 +593,7 @@ static void bounceFromWalls(BallWork *ball) {
   ball->vx = clampFix(ball->vx, -MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);
 }
 
-static void recordFallenBall(BallWork *ball) {
+static void recordFallenBall(BallWork* ball) {
   int x = fix2int15(ball->x);
   int bin = clampInt((x - HIST_LEFT) / PEG_SPACING, 0, NUM_BINS - 1);
 
@@ -590,7 +604,7 @@ static void recordFallenBall(BallWork *ball) {
   spawnBall(ball);
 }
 
-static void updateBall(BallWork *ball) {
+static void updateBall(BallWork* ball) {
   ball->x += ball->vx;
   ball->y += ball->vy;
 
@@ -684,17 +698,20 @@ static void applyEncoderSteps(int32_t steps) {
 
   switch (adjust_mode) {
     case ADJUST_BALL_COUNT: {
-      // Three sizes rather than two, because the range now runs to 1810
-      // and ten at a time would still need 180 detents to cross it.
+      // Coarse across the range, fine near the ceiling. At 50 a detent the
+      // whole range is about 300 detents; at 1 a detent the last stretch
+      // can be walked up to the deadline a ball at a time.
       int step_size = 1;
-      if (ball_count >= 500) {
+      if (ball_count >= 12500) {
+        step_size = 10;
+      } else if (ball_count >= 500) {
         step_size = 50;
       } else if (ball_count >= 100) {
         step_size = 10;
       }
 
-      int new_count = clampInt(ball_count + (int)steps * step_size, 1,
-                               MAX_BALLS);
+      int new_count =
+          clampInt(ball_count + (int)steps * step_size, 1, MAX_BALLS);
       if (new_count != ball_count) {
         if (new_count > ball_count) {
           BallWork w;
@@ -720,8 +737,8 @@ static void applyEncoderSteps(int32_t steps) {
     }
 
     case ADJUST_GRAVITY: {
-      fix15 new_value = clampFix(gravity + steps * GRAVITY_STEP,
-                                 MIN_GRAVITY, MAX_GRAVITY);
+      fix15 new_value =
+          clampFix(gravity + steps * GRAVITY_STEP, MIN_GRAVITY, MAX_GRAVITY);
       if (new_value != gravity) {
         gravity = new_value;
         resetStatistics();
@@ -755,12 +772,12 @@ static void pollUserControls(void) {
 
 // The frame buffer the driver is currently letting us write to. It swaps
 // every frame; the driver exports it, so nothing in the driver changes.
-extern char *current_draw_buffer;
+extern char* current_draw_buffer;
 
 // Write one pixel, with no range check. Everything that calls this knows
 // its coordinates are on screen.
-static inline void putPixel(char *row_base, int x, char color) {
-  char *b = row_base + (x >> 1);
+static inline void putPixel(char* row_base, int x, char color) {
+  char* b = row_base + (x >> 1);
   if (x & 1) {
     *b = (char)((*b & 0x0f) | (color << 4));
   } else {
@@ -774,16 +791,15 @@ static inline void putPixel(char *row_base, int x, char color) {
 // peg needs, so a hollow peg is the cheaper one to draw as well as the
 // one that lets the balls behind it show through.
 static const signed char peg_ring[38][2] = {
-    {-2, -6}, {-1, -6}, {0, -6}, {1, -6}, {-4, -5}, {-3, -5}, {2, -5},
-    {3, -5},  {-5, -4}, {-4, -4}, {3, -4}, {4, -4}, {-5, -3}, {4, -3},
-    {-6, -2}, {5, -2},  {-6, -1}, {5, -1}, {-6, 0}, {5, 0},   {-6, 1},
-    {5, 1},   {-6, 2},  {5, 2},   {-5, 3}, {4, 3},  {-5, 4},  {-4, 4},
-    {3, 4},   {4, 4},   {-4, 5},  {-3, 5}, {2, 5},  {3, 5},   {-2, 6},
-    {-1, 6},  {0, 6},   {1, 6}};
+    {-2, -6}, {-1, -6}, {0, -6}, {1, -6}, {-4, -5}, {-3, -5}, {2, -5},  {3, -5},
+    {-5, -4}, {-4, -4}, {3, -4}, {4, -4}, {-5, -3}, {4, -3},  {-6, -2}, {5, -2},
+    {-6, -1}, {5, -1},  {-6, 0}, {5, 0},  {-6, 1},  {5, 1},   {-6, 2},  {5, 2},
+    {-5, 3},  {4, 3},   {-5, 4}, {-4, 4}, {3, 4},   {4, 4},   {-4, 5},  {-3, 5},
+    {2, 5},   {3, 5},   {-2, 6}, {-1, 6}, {0, 6},   {1, 6}};
 
 static inline void drawPeg(int cx, int cy, char color) {
   for (int k = 0; k < 38; k++) {
-    char *row = current_draw_buffer + 320 * (cy + peg_ring[k][1]);
+    char* row = current_draw_buffer + 320 * (cy + peg_ring[k][1]);
     putPixel(row, cx + peg_ring[k][0], color);
   }
 }
@@ -823,7 +839,7 @@ static inline void drawBall(int cx, int cy, char color) {
   cx &= ~1;
 
   char both = (char)(color | (color << 4));
-  char *p = current_draw_buffer + 320 * cy + (cx >> 1);
+  char* p = current_draw_buffer + 320 * cy + (cx >> 1);
 
   // The three 4-pixel rows: two whole bytes each
   *(p - 321) = both;
@@ -835,11 +851,11 @@ static inline void drawBall(int cx, int cy, char color) {
 
   // Top row: pixel cx-1 is the high nibble of the byte before, pixel cx
   // is the low nibble of this one.
-  char *top = p - 640;
+  char* top = p - 640;
   *(top - 1) = (char)((*(top - 1) & 0x0f) | (color << 4));
   *(top) = (char)((*(top) & 0xf0) | color);
 
-  char *bottom = p + 640;
+  char* bottom = p + 640;
   *(bottom - 1) = (char)((*(bottom - 1) & 0x0f) | (color << 4));
   *(bottom) = (char)((*(bottom) & 0xf0) | color);
 }
@@ -882,7 +898,7 @@ static void drawHistogram(void) {
   drawHLine(HIST_LEFT, HIST_BASE_Y, NUM_BINS * PEG_SPACING, DISPLAY_COLOUR);
 }
 
-static const char *activeMarker(AdjustMode mode) {
+static const char* activeMarker(AdjustMode mode) {
   return adjust_mode == mode ? ">" : " ";
 }
 
@@ -912,7 +928,8 @@ static void drawReadout(uint32_t frame_us, uint32_t missed_frames) {
 
     sprintf(readout[0], "Dropped: %lu   Time: %02lu:%02lu:%02lu",
             (unsigned long)droppedTotal(), (unsigned long)(seconds / 3600),
-            (unsigned long)((seconds / 60) % 60), (unsigned long)(seconds % 60));
+            (unsigned long)((seconds / 60) % 60),
+            (unsigned long)(seconds % 60));
 
     sprintf(readout[1], "%s Balls: %d", activeMarker(ADJUST_BALL_COUNT),
             ball_count);
@@ -976,7 +993,7 @@ static void drawFrame(uint32_t previous_frame_us, uint32_t missed_frames) {
 // === Animation protothread (teacher animation-demo structure)
 // ================================================================
 
-static PT_THREAD(protothread_anim(struct pt *pt)) {
+static PT_THREAD(protothread_anim(struct pt* pt)) {
   PT_BEGIN(pt);
 
   spawnAllBalls();
@@ -1023,7 +1040,7 @@ int main(void) {
   // The voltage has to settle before the clock is raised, hence the
   // pause -- changing both at once is how an overclock fails to boot.
   if (SYS_CLOCK_KHZ > 150000) {
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    vreg_set_voltage(VREG_VOLTAGE_1_25);
     sleep_ms(10);
   }
 
