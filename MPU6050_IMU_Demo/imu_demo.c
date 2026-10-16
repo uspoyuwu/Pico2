@@ -1,0 +1,410 @@
+/**
+ * Lab 3 (1D helicopter) — week 2 version
+ * Based on V. Hunter Adams' MPU6050 IMU demo (vha3@cornell.edu)
+ *
+ * What this adds on top of the demo:
+ *   1. Arm angle from a complementary filter of accel + gyro (degrees,
+ *      -90 = hanging straight down, 0 = horizontal, +90 = straight up)
+ *   2. Gyro bias calibration at boot (keep the arm still while it runs)
+ *   3. Proportional control: control = base + Kp * (target - angle)
+ *   4. VGA: top plot = angle (white) + target (yellow),
+ *           bottom plot = low-passed motor command (green)
+ *   5. Serial commands to change parameters while running
+ *
+ * The motor starts DISABLED. Type "m 1" in the serial terminal to enable.
+ *
+ * HARDWARE CONNECTIONS
+ *  - GPIO 16 ---> VGA Hsync
+ *  - GPIO 17 ---> VGA Vsync
+ *  - GPIO 18 ---> 470 ohm resistor ---> VGA Green
+ *  - GPIO 19 ---> 330 ohm resistor ---> VGA Green
+ *  - GPIO 20 ---> 330 ohm resistor ---> VGA Blue
+ *  - GPIO 21 ---> 330 ohm resistor ---> VGA Red
+ *  - RP2350 GND ---> VGA GND
+ *  - GPIO 8 ---> MPU6050 SDA
+ *  - GPIO 9 ---> MPU6050 SCL
+ *  - 3.3v ---> MPU6050 VCC
+ *  - RP2350 GND ---> MPU6050 GND
+ *  - GPIO 6 (pin 9) ---> motor board PWM terminal
+ *  - RP2350 GND ---> motor board PWM GND terminal
+ *  - GPIO 0 / GPIO 1 ---> USB-serial RX / TX (UART0, 115200 baud)
+ */
+
+// Include standard libraries
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+// Include PICO libraries
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+// Include hardware libraries
+#include "hardware/pwm.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/adc.h"
+#include "hardware/pio.h"
+#include "hardware/i2c.h"
+#include "hardware/clocks.h"
+#include "hardware/sync.h"
+// Include custom libraries
+#include "VGA/vga16_graphics_v3.h"
+#include "mpu6050.h"
+#include "pt_cornell_rp2040_v1_4.h"
+
+////////////////////////////////////////////////////////////////////////////
+////////////////////// IMU ORIENTATION — CHECK THESE ////////////////////////
+////////////////////////////////////////////////////////////////////////////
+// These depend on how the IMU is glued to your arm. Find them with the
+// original demo (or with "r" below, which prints raw readings):
+//
+//  ACCEL_ALONG_AXIS: the accel axis that points ALONG the arm, toward the
+//      motor. With the arm horizontal it reads ~0 g; hanging down it reads
+//      about +/-1 g.
+//  ACCEL_UP_AXIS: the accel axis that reads about +/-1 g when the arm is
+//      horizontal (perpendicular to the arm, in the plane it swings in).
+//  The two *_SIGN values make: horizontal -> along = 0,  up = +1 g
+//                              hanging   -> along = -1 g, up = 0
+//
+//  GYRO_AXIS: the gyro axis parallel to the hinge. It is the one that
+//      changes when you swing the arm; the other two stay near 0.
+//  GYRO_SIGN: make it +1 or -1 so that swinging the arm UP gives a
+//      POSITIVE rate. If this is wrong the filtered angle lags badly or
+//      drifts the opposite way from the accel angle.
+//
+// Axis index: 0 = x, 1 = y, 2 = z
+// Measured on our arm: horizontal -> z = +0.89 g, arm tilted down -> x positive
+#define ACCEL_ALONG_AXIS 0
+#define ACCEL_ALONG_SIGN -1.0f
+#define ACCEL_UP_AXIS    2
+#define ACCEL_UP_SIGN    1.0f
+#define GYRO_AXIS        1
+#define GYRO_SIGN        1.0f
+
+////////////////////////////////////////////////////////////////////////////
+/////////////////////////// CONTROL PARAMETERS /////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+#define DT        0.001f      // ISR period: 1 kHz PWM wrap
+#define RAD2DEG   57.29578f
+#define WRAPVAL   6000        // PWM counts per period
+#define CLKDIV    25.0f       // 150 MHz / (25 * 6001) = ~1 kHz
+#define PWM_PIN   6           // motor board PWM terminal (physical pin 9)
+
+// Complementary filter weight on the gyro path (0..1). Closer to 1 trusts
+// the gyro more: smoother, but slower to correct drift.
+volatile float alpha = 0.995f ;
+
+// Controller state, shared between the ISR and the threads.
+// RP2350 has a hardware FPU, so float math in the ISR is fast.
+volatile float angle_deg   = -90.0f ;  // filtered arm angle
+volatile float accel_deg   = -90.0f ;  // accel-only angle (for debugging)
+volatile float target_deg  = 0.0f ;    // where we want the arm
+volatile float Kp          = 20.0f ;   // PWM counts per degree of error
+volatile float base_pwm    = 0.0f ;    // feed-forward / hover offset
+volatile int   motor_on    = 0 ;       // 0 = motor forced off
+volatile float control     = 0.0f ;    // command sent to PWM (0..WRAPVAL)
+volatile float motor_disp  = 0.0f ;    // low-passed control, for display
+float gyro_bias = 0.0f ;               // deg/s, measured at boot
+
+////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// DISPLAY ///////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+#define LEFT_EDGE 81
+#define PLOT_WIDTH 530
+#define PLOT_HEIGHT 150
+#define TOP_PLOT_BOTTOM 230      // angle plot spans y = 80..230
+#define BOTTOM_PLOT_BOTTOM 430   // motor plot spans y = 280..430
+
+float angle_buf[PLOT_WIDTH] ;
+float motor_buf[PLOT_WIDTH] ;
+volatile int head = 0 ;          // oldest sample in the circular buffers
+volatile int threshold = 10 ;    // store one sample every N ISR calls
+volatile int throttle = 0 ;
+char screentext[64] ;
+
+// Arrays in which raw measurements will be stored (15.16 fixed point)
+fix15 acceleration[3], gyro[3] ;
+
+uint slice_num ;
+
+#define clampf(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+
+// Angle from the accelerometer alone (degrees)
+static inline float accel_angle(void) {
+    float along = ACCEL_ALONG_SIGN * fix2float15(acceleration[ACCEL_ALONG_AXIS]) ;
+    float up    = ACCEL_UP_SIGN    * fix2float15(acceleration[ACCEL_UP_AXIS]) ;
+    return atan2f(along, up) * RAD2DEG ;
+}
+
+// Gyro rate about the hinge, bias removed (deg/s)
+static inline float gyro_rate(void) {
+    return GYRO_SIGN * fix2float15(gyro[GYRO_AXIS]) - gyro_bias ;
+}
+
+////////////////////////////////////////////////////////////////////////////
+/////////////////////////// 1 kHz CONTROL ISR //////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+void on_pwm_wrap() {
+    // Clear the interrupt flag that brought us here
+    pwm_clear_irq(slice_num) ;
+    // GPIO 14 is high while the ISR runs: put a scope on it to see how
+    // much of the 1 ms budget the ISR uses
+    gpio_put(14, 1) ;
+
+    // 1. Read the IMU (accel in g, gyro in deg/s, 15.16 fixed point)
+    mpu6050_read_raw(acceleration, gyro) ;
+
+    // 2. Complementary filter
+    float a_deg = accel_angle() ;
+    float new_angle = alpha * (angle_deg + gyro_rate() * DT)
+                    + (1.0f - alpha) * a_deg ;
+    accel_deg = a_deg ;
+    angle_deg = new_angle ;
+
+    // 3. Proportional control (with a constant feed-forward term)
+    float u = 0.0f ;
+    if (motor_on) {
+        float error = target_deg - new_angle ;
+        u = base_pwm + Kp * error ;
+        u = clampf(u, 0.0f, (float)WRAPVAL) ;
+    }
+    control = u ;
+
+    // 4. Drive the motor
+    pwm_set_gpio_level(PWM_PIN, (uint16_t)u) ;
+
+    // 5. Low-pass the command for display (time constant ~16 ms)
+    motor_disp = motor_disp + (u - motor_disp) * (1.0f / 16.0f) ;
+
+    // 6. Save samples for the VGA plots
+    throttle += 1 ;
+    if (throttle >= threshold) {
+        throttle = 0 ;
+        angle_buf[head] = new_angle ;
+        motor_buf[head] = motor_disp ;
+        head = ((head + 1) == PLOT_WIDTH) ? 0 : (head + 1) ;
+    }
+
+    gpio_put(14, 0) ;
+}
+
+////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// VGA ///////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+// Map an angle (-90..+90 deg) to a screen row in the top plot
+static inline int angle_to_y(float deg) {
+    float y = TOP_PLOT_BOTTOM - (deg + 90.0f) / 180.0f * PLOT_HEIGHT ;
+    return (int)clampf(y, TOP_PLOT_BOTTOM - PLOT_HEIGHT, TOP_PLOT_BOTTOM) ;
+}
+
+// Map a motor command (0..WRAPVAL) to a screen row in the bottom plot
+static inline int motor_to_y(float m) {
+    float y = BOTTOM_PLOT_BOTTOM - m / (float)WRAPVAL * PLOT_HEIGHT ;
+    return (int)clampf(y, BOTTOM_PLOT_BOTTOM - PLOT_HEIGHT, BOTTOM_PLOT_BOTTOM) ;
+}
+
+void drawAxes() {
+    setTextSize(1) ;
+    setTextColor(WHITE) ;
+
+    // Top plot: angle
+    drawVLine(80, TOP_PLOT_BOTTOM - PLOT_HEIGHT, PLOT_HEIGHT, CYAN) ;
+    drawHLine(75, angle_to_y(90),  5, CYAN) ;
+    drawHLine(75, angle_to_y(0),   5, CYAN) ;
+    drawHLine(75, angle_to_y(-90), 5, CYAN) ;
+    setCursor(45, angle_to_y(90) - 4) ;  writeString("+90") ;
+    setCursor(57, angle_to_y(0) - 4) ;   writeString("0") ;
+    setCursor(45, angle_to_y(-90) - 4) ; writeString("-90") ;
+    setCursor(LEFT_EDGE, 62) ;
+    writeString("Angle (deg): white = measured, yellow = target") ;
+
+    // Bottom plot: motor command
+    drawVLine(80, BOTTOM_PLOT_BOTTOM - PLOT_HEIGHT, PLOT_HEIGHT, CYAN) ;
+    drawHLine(75, motor_to_y(WRAPVAL), 5, CYAN) ;
+    drawHLine(75, motor_to_y(WRAPVAL / 2), 5, CYAN) ;
+    drawHLine(75, motor_to_y(0), 5, CYAN) ;
+    setCursor(40, motor_to_y(WRAPVAL) - 4) ;     writeString("6000") ;
+    setCursor(40, motor_to_y(WRAPVAL / 2) - 4) ; writeString("3000") ;
+    setCursor(57, motor_to_y(0) - 4) ;           writeString("0") ;
+    setCursor(LEFT_EDGE, 262) ;
+    writeString("Motor command (low-passed PWM counts)") ;
+}
+
+static PT_THREAD (protothread_draw(struct pt *pt))
+{
+    PT_BEGIN(pt) ;
+    static int start ;
+    static int i ;
+
+    drawAxes() ;
+    copy_buffer_to_other() ;
+
+    while (1) {
+        // Wait for a buffer swap
+        PT_YIELD_UNTIL(pt, draw_start_signal()) ;
+        gpio_put(15, !gpio_get(15)) ;
+
+        clearLowFrame(0, BLACK) ;
+        drawAxes() ;
+
+        // Status line
+        setTextColor2(WHITE, BLACK) ;
+        setCursor(10, 10) ;
+        sprintf(screentext, "Kp=%.1f  base=%.0f  target=%.1f deg  motor %s",
+                Kp, base_pwm, target_deg, motor_on ? "ON " : "OFF") ;
+        writeString(screentext) ;
+        setCursor(10, 24) ;
+        sprintf(screentext, "angle=%6.1f deg   accel-only=%6.1f deg   cmd=%4.0f",
+                angle_deg, accel_deg, motor_disp) ;
+        writeString(screentext) ;
+
+        // Target line
+        drawHLine(LEFT_EDGE, angle_to_y(target_deg), PLOT_WIDTH, YELLOW) ;
+
+        // Data, oldest --> newest
+        start = head ;
+        for (i = 0; i < PLOT_WIDTH; i++) {
+            drawPixel(LEFT_EDGE + i, angle_to_y(angle_buf[start]), WHITE) ;
+            drawPixel(LEFT_EDGE + i, motor_to_y(motor_buf[start]), GREEN) ;
+            start = ((start + 1) == PLOT_WIDTH) ? 0 : (start + 1) ;
+        }
+    }
+    PT_END(pt) ;
+}
+
+////////////////////////////////////////////////////////////////////////////
+///////////////////////////// SERIAL COMMANDS //////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+//   p 20     set Kp
+//   a 0      set target angle in degrees (-90 down, 0 horizontal)
+//   b 2500   set base (feed-forward) PWM, 0..6000
+//   f 0.995  set complementary filter alpha, 0..1
+//   m 1      motor on   (m 0 = motor off)
+//   t 10     plot speed: store one sample every N ms
+//   r        print raw accel/gyro (for finding the axes above)
+//   ?        print current settings
+static PT_THREAD (protothread_serial(struct pt *pt))
+{
+    PT_BEGIN(pt) ;
+    static char cmd ;
+    static float val ;
+    static int n ;
+
+    sprintf(pt_serial_out_buffer,
+            "\r\nCommands: p <Kp>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, ?\r\n") ;
+    serial_write ;
+
+    while (1) {
+        sprintf(pt_serial_out_buffer, "cmd> ") ;
+        serial_write ;
+        serial_read ;
+        n = sscanf(pt_serial_in_buffer, " %c %f", &cmd, &val) ;
+        if (n < 1) continue ;
+
+        if (cmd == 'p' && n == 2) {
+            Kp = val ;
+        }
+        else if (cmd == 'a' && n == 2) {
+            target_deg = clampf(val, -90.0f, 90.0f) ;
+        }
+        else if (cmd == 'b' && n == 2) {
+            base_pwm = clampf(val, 0.0f, (float)WRAPVAL) ;
+        }
+        else if (cmd == 'f' && n == 2) {
+            alpha = clampf(val, 0.0f, 1.0f) ;
+        }
+        else if (cmd == 'm' && n == 2) {
+            motor_on = (val != 0.0f) ;
+        }
+        else if (cmd == 't' && n == 2) {
+            if (val >= 1.0f) threshold = (int)val ;
+        }
+        else if (cmd == 'r') {
+            sprintf(pt_serial_out_buffer,
+                    "accel g: x=%5.2f y=%5.2f z=%5.2f | gyro dps: x=%7.1f y=%7.1f z=%7.1f\r\n",
+                    fix2float15(acceleration[0]), fix2float15(acceleration[1]),
+                    fix2float15(acceleration[2]), fix2float15(gyro[0]),
+                    fix2float15(gyro[1]), fix2float15(gyro[2])) ;
+            serial_write ;
+            continue ;
+        }
+        else if (cmd != '?') {
+            sprintf(pt_serial_out_buffer, "unknown command\r\n") ;
+            serial_write ;
+            continue ;
+        }
+
+        sprintf(pt_serial_out_buffer,
+                "Kp=%.2f base=%.0f target=%.1f alpha=%.4f motor=%s angle=%.1f bias=%.2f\r\n",
+                Kp, base_pwm, target_deg, alpha, motor_on ? "ON" : "OFF",
+                angle_deg, gyro_bias) ;
+        serial_write ;
+    }
+    PT_END(pt) ;
+}
+
+////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// STARTUP ///////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+void core1_entry() {
+    gpio_init(15) ;
+    gpio_set_dir(15, GPIO_OUT) ;
+    gpio_put(15, 0) ;
+    pt_add_thread(protothread_draw) ;
+    pt_schedule_start ;
+}
+
+int main() {
+    set_sys_clock_khz(150000, true) ;
+    stdio_init_all() ;
+    initVGA() ;
+
+    // Debug pin: high while the ISR runs
+    gpio_init(14) ;
+    gpio_set_dir(14, GPIO_OUT) ;
+    gpio_put(14, 0) ;
+
+    //////////////////////////// I2C + IMU ////////////////////////////////
+    i2c_init(I2C_CHAN, I2C_BAUD_RATE) ;
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C) ;
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C) ;
+    mpu6050_reset() ;
+    sleep_ms(100) ;   // let the sensor settle after wake-up
+
+    // Gyro bias: average 1000 readings (~1.5 s). Keep the arm STILL.
+    printf("\r\nCalibrating gyro, keep the arm still...\r\n") ;
+    float sum = 0.0f ;
+    for (int k = 0; k < 1000; k++) {
+        mpu6050_read_raw(acceleration, gyro) ;
+        sum += GYRO_SIGN * fix2float15(gyro[GYRO_AXIS]) ;
+        sleep_us(1000) ;
+    }
+    gyro_bias = sum / 1000.0f ;
+    angle_deg = accel_angle() ;   // start the filter at the accel angle
+    for (int k = 0; k < PLOT_WIDTH; k++) {
+        angle_buf[k] = angle_deg ;
+        motor_buf[k] = 0.0f ;
+    }
+    printf("gyro bias = %.3f deg/s, start angle = %.1f deg\r\n", gyro_bias, angle_deg) ;
+
+    /////////////////////////////// PWM ///////////////////////////////////
+    gpio_set_function(PWM_PIN, GPIO_FUNC_PWM) ;
+    slice_num = pwm_gpio_to_slice_num(PWM_PIN) ;   // GPIO 6 = slice 3, channel A
+
+    pwm_clear_irq(slice_num) ;
+    pwm_set_irq_enabled(slice_num, true) ;
+    irq_set_exclusive_handler(PWM_IRQ_WRAP, on_pwm_wrap) ;
+    irq_set_enabled(PWM_IRQ_WRAP, true) ;
+
+    pwm_set_wrap(slice_num, WRAPVAL) ;
+    pwm_set_clkdiv(slice_num, CLKDIV) ;
+    pwm_set_gpio_level(PWM_PIN, 0) ;   // motor off at boot
+    pwm_set_mask_enabled((1u << slice_num)) ;
+
+    ////////////////////////////// THREADS ////////////////////////////////
+    multicore_reset_core1() ;
+    multicore_launch_core1(core1_entry) ;
+
+    pt_add_thread(protothread_serial) ;
+    pt_schedule_start ;
+}
