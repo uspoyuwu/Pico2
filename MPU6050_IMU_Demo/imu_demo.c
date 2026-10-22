@@ -98,6 +98,9 @@ volatile float alpha = 0.995f ;
 // RP2350 has a hardware FPU, so float math in the ISR is fast.
 volatile float angle_deg   = -90.0f ;  // filtered arm angle
 volatile float accel_deg   = -90.0f ;  // accel-only angle (for debugging)
+volatile float gyro_deg    = -90.0f ;  // gyro-only angle: pure integration, drifts
+volatile float gyro_part   = 0.0f ;    // alpha * (angle + rate*dt)   (filter term 1)
+volatile float accel_part  = 0.0f ;    // (1 - alpha) * accel angle   (filter term 2)
 volatile float target_deg  = 0.0f ;    // where we want the arm
 volatile float Kp          = 20.0f ;   // PWM counts per degree of error
 volatile float base_pwm    = 0.0f ;    // feed-forward / hover offset
@@ -117,10 +120,12 @@ float gyro_bias = 0.0f ;               // deg/s, measured at boot
 
 float angle_buf[PLOT_WIDTH] ;
 float motor_buf[PLOT_WIDTH] ;
+float accel_buf[PLOT_WIDTH] ;    // accel-only angle history
+float gyro_buf[PLOT_WIDTH] ;     // gyro-only angle history
 volatile int head = 0 ;          // oldest sample in the circular buffers
 volatile int threshold = 10 ;    // store one sample every N ISR calls
 volatile int throttle = 0 ;
-char screentext[64] ;
+char screentext[96] ;
 
 // Arrays in which raw measurements will be stored (15.16 fixed point)
 fix15 acceleration[3], gyro[3] ;
@@ -128,6 +133,34 @@ fix15 acceleration[3], gyro[3] ;
 uint slice_num ;
 
 #define clampf(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+
+// I2C bus recovery. If the Pico resets in the middle of an I2C read, the
+// MPU6050 (which stays powered) can be left holding SDA low, waiting for
+// clocks that never come. i2c_write_blocking() then waits forever.
+// Fix: drive SCL by hand (open-drain style) until the IMU lets go of SDA,
+// then send a STOP condition. Standard I2C recovery (9 clock pulses).
+static void i2c_line(uint pin, int high) {
+    if (high) gpio_set_dir(pin, GPIO_IN) ;               // released: pull-up makes it high
+    else    { gpio_put(pin, 0) ; gpio_set_dir(pin, GPIO_OUT) ; }   // driven low
+    sleep_us(5) ;
+}
+static int i2c_bus_recover(void) {   // returns 1 if SDA was stuck low
+    gpio_init(SDA_PIN) ; gpio_pull_up(SDA_PIN) ;
+    gpio_init(SCL_PIN) ; gpio_pull_up(SCL_PIN) ;
+    i2c_line(SDA_PIN, 1) ;
+    i2c_line(SCL_PIN, 1) ;
+    int stuck = !gpio_get(SDA_PIN) ;
+    for (int k = 0; k < 9 && !gpio_get(SDA_PIN); k++) {
+        i2c_line(SCL_PIN, 0) ;
+        i2c_line(SCL_PIN, 1) ;
+    }
+    // STOP: SDA goes low -> high while SCL is high
+    i2c_line(SCL_PIN, 0) ;
+    i2c_line(SDA_PIN, 0) ;
+    i2c_line(SCL_PIN, 1) ;
+    i2c_line(SDA_PIN, 1) ;
+    return stuck ;
+}
 
 // Angle from the accelerometer alone (degrees)
 static inline float accel_angle(void) {
@@ -156,10 +189,15 @@ void on_pwm_wrap() {
 
     // 2. Complementary filter
     float a_deg = accel_angle() ;
-    float new_angle = alpha * (angle_deg + gyro_rate() * DT)
-                    + (1.0f - alpha) * a_deg ;
-    accel_deg = a_deg ;
-    angle_deg = new_angle ;
+    float rate  = gyro_rate() ;
+    float g_part = alpha * (angle_deg + rate * DT) ;   // gyro path
+    float a_part = (1.0f - alpha) * a_deg ;            // accel path
+    float new_angle = g_part + a_part ;                // = complementary output
+    accel_deg  = a_deg ;
+    gyro_deg  += rate * DT ;                           // gyro alone, for comparison
+    gyro_part  = g_part ;
+    accel_part = a_part ;
+    angle_deg  = new_angle ;
 
     // 3. Proportional control (with a constant feed-forward term)
     float u = 0.0f ;
@@ -181,6 +219,8 @@ void on_pwm_wrap() {
     if (throttle >= threshold) {
         throttle = 0 ;
         angle_buf[head] = new_angle ;
+        accel_buf[head] = a_deg ;
+        gyro_buf[head]  = gyro_deg ;
         motor_buf[head] = motor_disp ;
         head = ((head + 1) == PLOT_WIDTH) ? 0 : (head + 1) ;
     }
@@ -216,7 +256,7 @@ void drawAxes() {
     setCursor(57, angle_to_y(0) - 4) ;   writeString("0") ;
     setCursor(45, angle_to_y(-90) - 4) ; writeString("-90") ;
     setCursor(LEFT_EDGE, 62) ;
-    writeString("Angle (deg): white = measured, yellow = target") ;
+    writeString("Angle: white=complementary  red=accel-only  magenta=gyro-only  yellow=target") ;
 
     // Bottom plot: motor command
     drawVLine(80, BOTTOM_PLOT_BOTTOM - PLOT_HEIGHT, PLOT_HEIGHT, CYAN) ;
@@ -254,8 +294,12 @@ static PT_THREAD (protothread_draw(struct pt *pt))
                 Kp, base_pwm, target_deg, motor_on ? "ON " : "OFF") ;
         writeString(screentext) ;
         setCursor(10, 24) ;
-        sprintf(screentext, "angle=%6.1f deg   accel-only=%6.1f deg   cmd=%4.0f",
-                angle_deg, accel_deg, motor_disp) ;
+        sprintf(screentext, "angle=%6.1f  accel-only=%6.1f  gyro-only=%6.1f  cmd=%4.0f",
+                angle_deg, accel_deg, gyro_deg, motor_disp) ;
+        writeString(screentext) ;
+        setCursor(10, 38) ;
+        sprintf(screentext, "filter: %.3f*(gyro path)=%7.2f + %.3f*accel=%6.2f -> %6.1f",
+                alpha, gyro_part, 1.0f - alpha, accel_part, gyro_part + accel_part) ;
         writeString(screentext) ;
 
         // Target line
@@ -264,6 +308,8 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         // Data, oldest --> newest
         start = head ;
         for (i = 0; i < PLOT_WIDTH; i++) {
+            drawPixel(LEFT_EDGE + i, angle_to_y(accel_buf[start]), RED) ;
+            drawPixel(LEFT_EDGE + i, angle_to_y(gyro_buf[start]), MAGENTA) ;
             drawPixel(LEFT_EDGE + i, angle_to_y(angle_buf[start]), WHITE) ;
             drawPixel(LEFT_EDGE + i, motor_to_y(motor_buf[start]), GREEN) ;
             start = ((start + 1) == PLOT_WIDTH) ? 0 : (start + 1) ;
@@ -282,6 +328,7 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //   m 1      motor on   (m 0 = motor off)
 //   t 10     plot speed: store one sample every N ms
 //   r        print raw accel/gyro (for finding the axes above)
+//   g        reset the gyro-only angle to the current filtered angle
 //   ?        print current settings
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
@@ -291,7 +338,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     static int n ;
 
     sprintf(pt_serial_out_buffer,
-            "\r\nCommands: p <Kp>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, ?\r\n") ;
+            "\r\nCommands: p <Kp>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, g, ?\r\n") ;
     serial_write ;
 
     while (1) {
@@ -318,6 +365,9 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         }
         else if (cmd == 't' && n == 2) {
             if (val >= 1.0f) threshold = (int)val ;
+        }
+        else if (cmd == 'g') {
+            gyro_deg = angle_deg ;   // gyro-only drifts; line it back up
         }
         else if (cmd == 'r') {
             sprintf(pt_serial_out_buffer,
@@ -365,9 +415,29 @@ int main() {
     gpio_put(14, 0) ;
 
     //////////////////////////// I2C + IMU ////////////////////////////////
+    int was_stuck = i2c_bus_recover() ;   // un-stick the bus if the IMU was mid-transfer
+    printf("\r\nI2C bus: %s, SDA now %s\r\n",
+           was_stuck ? "was STUCK (SDA low), recovered" : "OK",
+           gpio_get(SDA_PIN) ? "high (good)" : "STILL LOW -- check wiring") ;
     i2c_init(I2C_CHAN, I2C_BAUD_RATE) ;
     gpio_set_function(SDA_PIN, GPIO_FUNC_I2C) ;
     gpio_set_function(SCL_PIN, GPIO_FUNC_I2C) ;
+    gpio_pull_up(SDA_PIN) ;
+    gpio_pull_up(SCL_PIN) ;
+
+    // Full device reset of the MPU6050 (PWR_MGMT_1 bit 7), with a timeout
+    // so a missing/miswired IMU can't hang the boot
+    uint8_t dev_reset[] = {0x6B, 0x80} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, dev_reset, 2, false, 2000) ;
+    sleep_ms(100) ;
+
+    // WHO_AM_I (register 0x75) should read back 0x68
+    uint8_t reg = 0x75, who = 0 ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, &reg, 1, true, 2000) ;
+    int got = i2c_read_timeout_us(I2C_CHAN, ADDRESS, &who, 1, false, 2000) ;
+    if (got == 1) printf("MPU6050 WHO_AM_I = 0x%02x (expect 0x68)\r\n", who) ;
+    else          printf("MPU6050 did not answer -- check VCC, GND, SDA=GP8, SCL=GP9\r\n") ;
+
     mpu6050_reset() ;
     sleep_ms(100) ;   // let the sensor settle after wake-up
 
@@ -381,8 +451,12 @@ int main() {
     }
     gyro_bias = sum / 1000.0f ;
     angle_deg = accel_angle() ;   // start the filter at the accel angle
+    gyro_deg  = angle_deg ;       // gyro-only starts at the same place
+    accel_deg = angle_deg ;
     for (int k = 0; k < PLOT_WIDTH; k++) {
         angle_buf[k] = angle_deg ;
+        accel_buf[k] = angle_deg ;
+        gyro_buf[k]  = angle_deg ;
         motor_buf[k] = 0.0f ;
     }
     printf("gyro bias = %.3f deg/s, start angle = %.1f deg\r\n", gyro_bias, angle_deg) ;
