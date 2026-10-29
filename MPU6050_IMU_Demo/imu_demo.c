@@ -6,7 +6,9 @@
  *   1. Arm angle from a complementary filter of accel + gyro (degrees,
  *      -90 = hanging straight down, 0 = horizontal, +90 = straight up)
  *   2. Gyro bias calibration at boot (keep the arm still while it runs)
- *   3. Proportional control: control = base + Kp * (target - angle)
+ *   3. PID control: control = base + Kp*error + I - Kd*rate,  I += Ki*error*dt
+ *      [Week 3 stage 1: D term.  Stage 2: I term with anti-windup.
+ *       Ki = Kd = 0 behaves exactly like week 2]
  *   4. VGA: top plot = angle (white) + target (yellow),
  *           bottom plot = low-passed motor command (green)
  *   5. Serial commands to change parameters while running
@@ -28,6 +30,15 @@
  *  - GPIO 6 (pin 9) ---> motor board PWM terminal
  *  - RP2350 GND ---> motor board PWM GND terminal
  *  - GPIO 0 / GPIO 1 ---> USB-serial RX / TX (UART0, 115200 baud)
+ *  - GPIO 2 (pin 4) ---> push button ---> GND (pin 3)   [Week 3 demo button]
+ *
+ * DEMO BUTTON (Week 3, stage 3)
+ *  - Hold the button:   motor OFF, arm falls to its rest position
+ *  - Release (t = 0):   motor ON, target   0 deg
+ *  - t = 5 s:           target +30 deg
+ *  - t = 10 s:          target -30 deg
+ *  - t = 15 s:          target   0 deg  (keeps hovering afterwards)
+ *  - Typing "a" or "m" on the serial port cancels the sequence.
  */
 
 // Include standard libraries
@@ -47,6 +58,7 @@
 #include "hardware/i2c.h"
 #include "hardware/clocks.h"
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 // Include custom libraries
 #include "VGA/vga16_graphics_v3.h"
 #include "mpu6050.h"
@@ -89,6 +101,7 @@
 #define WRAPVAL   6000        // PWM counts per period
 #define CLKDIV    25.0f       // 150 MHz / (25 * 6001) = ~1 kHz
 #define PWM_PIN   6           // motor board PWM terminal (physical pin 9)
+#define BUTTON_PIN 2          // [Week 3] demo button (physical pin 4) to GND
 
 // Complementary filter weight on the gyro path (0..1). Closer to 1 trusts
 // the gyro more: smoother, but slower to correct drift.
@@ -103,11 +116,26 @@ volatile float gyro_part   = 0.0f ;    // alpha * (angle + rate*dt)   (filter te
 volatile float accel_part  = 0.0f ;    // (1 - alpha) * accel angle   (filter term 2)
 volatile float target_deg  = 0.0f ;    // where we want the arm
 volatile float Kp          = 20.0f ;   // PWM counts per degree of error
+volatile float Kd          = 0.0f ;    // [Week 3] PWM counts per (deg/s) of rotation
+volatile float Ki          = 0.0f ;    // [Week 3] PWM counts per (deg * s) of accumulated error
+volatile float i_term      = 0.0f ;    // [Week 3] integral term (PWM counts), kept between ISRs
+volatile float I_max       = 1000.0f ; // [Week 3] max |I term| in PWM counts ("l" command)
+#define KI_MAX  200.0f                 // [Week 3] largest Ki the "i" command accepts
+volatile float p_term      = 0.0f ;    // [Week 3] Kp * error, for display
+volatile float d_term      = 0.0f ;    // [Week 3] -Kd * rate, for display
+volatile float rate_disp   = 0.0f ;    // [Week 3] gyro rate (deg/s), low-passed for display
 volatile float base_pwm    = 0.0f ;    // feed-forward / hover offset
 volatile int   motor_on    = 0 ;       // 0 = motor forced off
 volatile float control     = 0.0f ;    // command sent to PWM (0..WRAPVAL)
 volatile float motor_disp  = 0.0f ;    // low-passed control, for display
 float gyro_bias = 0.0f ;               // deg/s, measured at boot
+
+// [Week 3] Demo button sequence state
+#define DEMO_IDLE 0                    // not running (normal serial control)
+#define DEMO_HOLD 1                    // button held: motor off
+#define DEMO_RUN  2                    // released: stepping through targets
+volatile int   demo_state = DEMO_IDLE ;
+volatile float demo_time  = 0.0f ;     // seconds since the button was released
 
 ////////////////////////////////////////////////////////////////////////////
 //////////////////////////////// DISPLAY ///////////////////////////////////
@@ -196,15 +224,39 @@ void on_pwm_wrap() {
     accel_deg  = a_deg ;
     gyro_deg  += rate * DT ;                           // gyro alone, for comparison
     gyro_part  = g_part ;
+    rate_disp  = rate_disp + (rate - rate_disp) * (1.0f / 16.0f) ;
     accel_part = a_part ;
     angle_deg  = new_angle ;
 
-    // 3. Proportional control (with a constant feed-forward term)
+    // 3. PID control (with a constant feed-forward term)   [Week 3]
+    //    P pushes toward the target; D brakes any rotation;
+    //    I slowly adds up any error that stays, until it is gone.
+    //    D uses the gyro rate directly: rate = d(angle)/dt, so
+    //    d(error)/dt = -rate when the target is constant.
     float u = 0.0f ;
     if (motor_on) {
         float error = target_deg - new_angle ;
-        u = base_pwm + Kp * error ;
+        float p = Kp * error ;
+        float d = -Kd * rate ;
+
+        // Integral with anti-windup: if the motor is already maxed out
+        // (or off) in the direction the error asks for, don't keep adding,
+        // otherwise I grows huge and the arm overshoots badly later.
+        float u_try = base_pwm + p + i_term + d ;
+        int saturated = (u_try >= (float)WRAPVAL && error > 0.0f) ||
+                        (u_try <= 0.0f && error < 0.0f) ;
+        if (!saturated) i_term += Ki * error * DT ;
+        i_term = clampf(i_term, -I_max, I_max) ;
+
+        p_term = p ;
+        d_term = d ;
+        u = base_pwm + p + i_term + d ;
         u = clampf(u, 0.0f, (float)WRAPVAL) ;
+    }
+    else {
+        p_term = 0.0f ;
+        d_term = 0.0f ;
+        i_term = 0.0f ;      // start fresh every time the motor turns on
     }
     control = u ;
 
@@ -290,12 +342,22 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         // Status line
         setTextColor2(WHITE, BLACK) ;
         setCursor(10, 10) ;
-        sprintf(screentext, "Kp=%.1f  base=%.0f  target=%.1f deg  motor %s",
-                Kp, base_pwm, target_deg, motor_on ? "ON " : "OFF") ;
+        sprintf(screentext, "Kp=%.1f  Ki=%.1f  Kd=%.2f  base=%.0f  target=%.1f deg  motor %s",
+                Kp, Ki, Kd, base_pwm, target_deg, motor_on ? "ON " : "OFF") ;
+        writeString(screentext) ;
+        // Demo status, top right
+        setCursor(470, 24) ;
+        if      (demo_state == DEMO_RUN)  sprintf(screentext, "DEMO t=%5.1f s ", demo_time) ;
+        else if (demo_state == DEMO_HOLD) sprintf(screentext, "DEMO: button held") ;
+        else                              sprintf(screentext, "                 ") ;
         writeString(screentext) ;
         setCursor(10, 24) ;
         sprintf(screentext, "angle=%6.1f  accel-only=%6.1f  gyro-only=%6.1f  cmd=%4.0f",
                 angle_deg, accel_deg, gyro_deg, motor_disp) ;
+        writeString(screentext) ;
+        setCursor(10, 48) ;
+        sprintf(screentext, "cmd = base %5.0f + P %6.0f + I %5.0f/%4.0f + D %6.0f (rate %6.1f)",
+                base_pwm, p_term, i_term, I_max, d_term, rate_disp) ;
         writeString(screentext) ;
         setCursor(10, 38) ;
         sprintf(screentext, "filter: %.3f*(gyro path)=%7.2f + %.3f*accel=%6.2f -> %6.1f",
@@ -322,6 +384,10 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 ///////////////////////////// SERIAL COMMANDS //////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
 //   p 20     set Kp
+//   d 2      set Kd   [Week 3]
+//   i 20     set Ki   [Week 3]  (0..200)
+//   l 1000   set the max |I term| in PWM counts  [Week 3]
+//   z        reboot the Pico (re-inits the IMU and recalibrates the gyro)
 //   a 0      set target angle in degrees (-90 down, 0 horizontal)
 //   b 2500   set base (feed-forward) PWM, 0..6000
 //   f 0.995  set complementary filter alpha, 0..1
@@ -338,7 +404,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     static int n ;
 
     sprintf(pt_serial_out_buffer,
-            "\r\nCommands: p <Kp>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, g, ?\r\n") ;
+            "\r\nCommands: p <Kp>, i <Ki>, d <Kd>, l <Imax>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, g, z, ?\r\n") ;
     serial_write ;
 
     while (1) {
@@ -348,10 +414,32 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         n = sscanf(pt_serial_in_buffer, " %c %f", &cmd, &val) ;
         if (n < 1) continue ;
 
-        if (cmd == 'p' && n == 2) {
+        if (cmd == 'z') {
+            // Reboot the Pico (same as the reset button). The boot code then
+            // recovers the I2C bus, resets the MPU6050 and recalibrates the gyro.
+            // Note: the IMU itself stays powered; unplug USB for a full power cycle.
+            motor_on = 0 ;
+            pwm_set_gpio_level(PWM_PIN, 0) ;
+            sprintf(pt_serial_out_buffer, "rebooting... keep the arm still\r\n") ;
+            serial_write ;
+            sleep_ms(50) ;               // let the UART finish sending
+            watchdog_reboot(0, 0, 10) ;  // reboot in 10 ms
+            while (1) tight_loop_contents() ;
+        }
+        else if (cmd == 'i' && n == 2) {
+            Ki = clampf(val, 0.0f, KI_MAX) ;
+        }
+        else if (cmd == 'l' && n == 2) {
+            I_max = clampf(val, 0.0f, (float)WRAPVAL) ;
+        }
+        else if (cmd == 'd' && n == 2) {
+            Kd = val ;
+        }
+        else if (cmd == 'p' && n == 2) {
             Kp = val ;
         }
         else if (cmd == 'a' && n == 2) {
+            demo_state = DEMO_IDLE ;            // a manual target cancels the demo
             target_deg = clampf(val, -90.0f, 90.0f) ;
         }
         else if (cmd == 'b' && n == 2) {
@@ -361,6 +449,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             alpha = clampf(val, 0.0f, 1.0f) ;
         }
         else if (cmd == 'm' && n == 2) {
+            demo_state = DEMO_IDLE ;            // manual motor control cancels the demo
             motor_on = (val != 0.0f) ;
         }
         else if (cmd == 't' && n == 2) {
@@ -385,10 +474,62 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         }
 
         sprintf(pt_serial_out_buffer,
-                "Kp=%.2f base=%.0f target=%.1f alpha=%.4f motor=%s angle=%.1f bias=%.2f\r\n",
-                Kp, base_pwm, target_deg, alpha, motor_on ? "ON" : "OFF",
-                angle_deg, gyro_bias) ;
+                "Kp=%.2f Ki=%.2f Kd=%.3f base=%.0f target=%.1f alpha=%.4f motor=%s angle=%.1f I=%.0f Imax=%.0f bias=%.2f\r\n",
+                Kp, Ki, Kd, base_pwm, target_deg, alpha, motor_on ? "ON" : "OFF",
+                angle_deg, i_term, I_max, gyro_bias) ;
         serial_write ;
+    }
+    PT_END(pt) ;
+}
+
+////////////////////////////////////////////////////////////////////////////
+/////////////////////////// DEMO BUTTON THREAD /////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+// [Week 3, stage 3] Polls the button every 10 ms. The button pulls GPIO 2
+// to GND, so pressed = 0. Requires 2 readings in a row (20 ms) to count a
+// press or a release, which ignores contact bounce.
+static PT_THREAD (protothread_demo(struct pt *pt))
+{
+    PT_BEGIN(pt) ;
+    static uint64_t t_release ;
+
+    while (1) {
+        PT_YIELD_usec(10000) ;
+
+        if (!gpio_get(BUTTON_PIN)) {
+            PT_YIELD_usec(10000) ;
+            if (gpio_get(BUTTON_PIN)) continue ;      // just a glitch
+
+            // Pressed and held: motor off, arm falls to rest
+            demo_state = DEMO_HOLD ;
+            motor_on   = 0 ;
+            target_deg = 0.0f ;
+            printf("DEMO: button held, motor off\r\n") ;
+
+            // Wait for a clean release (high on two readings in a row)
+            while (1) {
+                PT_YIELD_UNTIL(pt, gpio_get(BUTTON_PIN)) ;
+                PT_YIELD_usec(10000) ;
+                if (gpio_get(BUTTON_PIN)) break ;
+            }
+
+            // Released: this is t = 0
+            t_release  = time_us_64() ;
+            demo_time  = 0.0f ;
+            target_deg = 0.0f ;
+            motor_on   = 1 ;
+            demo_state = DEMO_RUN ;
+            printf("DEMO: released, t = 0, target 0\r\n") ;
+        }
+
+        if (demo_state == DEMO_RUN) {
+            demo_time = (float)(time_us_64() - t_release) * 1e-6f ;
+            if      (demo_time <  5.0f) target_deg =   0.0f ;
+            else if (demo_time < 10.0f) target_deg =  30.0f ;
+            else if (demo_time < 15.0f) target_deg = -30.0f ;
+            else                        target_deg =   0.0f ;
+            if (demo_time >= 20.0f) demo_state = DEMO_IDLE ;  // done, keep hovering at 0
+        }
     }
     PT_END(pt) ;
 }
@@ -475,10 +616,16 @@ int main() {
     pwm_set_gpio_level(PWM_PIN, 0) ;   // motor off at boot
     pwm_set_mask_enabled((1u << slice_num)) ;
 
+    /////////////////////////// DEMO BUTTON ///////////////////////////////
+    gpio_init(BUTTON_PIN) ;
+    gpio_set_dir(BUTTON_PIN, GPIO_IN) ;
+    gpio_pull_up(BUTTON_PIN) ;          // not pressed = high
+
     ////////////////////////////// THREADS ////////////////////////////////
     multicore_reset_core1() ;
     multicore_launch_core1(core1_entry) ;
 
+    pt_add_thread(protothread_demo) ;
     pt_add_thread(protothread_serial) ;
     pt_schedule_start ;
 }
