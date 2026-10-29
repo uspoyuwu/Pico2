@@ -8,7 +8,8 @@
  *   2. Gyro bias calibration at boot (keep the arm still while it runs)
  *   3. PID control: control = base + Kp*error + I - Kd*rate,  I += Ki*error*dt
  *      [Week 3 stage 1: D term.  Stage 2: I term with anti-windup.
- *       Ki = Kd = 0 behaves exactly like week 2]
+ *       Boot defaults are the tuned values: Kp 15, Ki 20, Kd 10,
+ *       base 1300, target -45 deg, so "m 1" runs right away]
  *   4. VGA: top plot = angle (white) + target (yellow),
  *           bottom plot = low-passed motor command (green)
  *   5. Serial commands to change parameters while running
@@ -30,7 +31,7 @@
  *  - GPIO 6 (pin 9) ---> motor board PWM terminal
  *  - RP2350 GND ---> motor board PWM GND terminal
  *  - GPIO 0 / GPIO 1 ---> USB-serial RX / TX (UART0, 115200 baud)
- *  - GPIO 2 (pin 4) ---> push button ---> GND (pin 3)   [Week 3 demo button]
+ *  - GPIO 15 (pin 20) ---> push button ---> GND (pin 18)   [Week 3 demo button]
  *
  * DEMO BUTTON (Week 3, stage 3)
  *  - Hold the button:   motor OFF, arm falls to its rest position
@@ -101,7 +102,7 @@
 #define WRAPVAL   6000        // PWM counts per period
 #define CLKDIV    25.0f       // 150 MHz / (25 * 6001) = ~1 kHz
 #define PWM_PIN   6           // motor board PWM terminal (physical pin 9)
-#define BUTTON_PIN 2          // [Week 3] demo button (physical pin 4) to GND
+#define BUTTON_PIN 15         // [Week 3] demo button (physical pin 20) to GND
 
 // Complementary filter weight on the gyro path (0..1). Closer to 1 trusts
 // the gyro more: smoother, but slower to correct drift.
@@ -114,17 +115,26 @@ volatile float accel_deg   = -90.0f ;  // accel-only angle (for debugging)
 volatile float gyro_deg    = -90.0f ;  // gyro-only angle: pure integration, drifts
 volatile float gyro_part   = 0.0f ;    // alpha * (angle + rate*dt)   (filter term 1)
 volatile float accel_part  = 0.0f ;    // (1 - alpha) * accel angle   (filter term 2)
-volatile float target_deg  = 0.0f ;    // where we want the arm
-volatile float Kp          = 20.0f ;   // PWM counts per degree of error
-volatile float Kd          = 0.0f ;    // [Week 3] PWM counts per (deg/s) of rotation
-volatile float Ki          = 0.0f ;    // [Week 3] PWM counts per (deg * s) of accumulated error
+volatile float target_deg  = -45.0f ;  // where we want the arm (boot default: near the rest stop)
+volatile float Kp          = 15.0f ;   // PWM counts per degree of error (tuned default)
+volatile float Kd          = 10.0f ;   // [Week 3] PWM counts per (deg/s) of rotation (tuned default)
+volatile float Ki          = 20.0f ;   // [Week 3] PWM counts per (deg * s) of accumulated error (tuned default)
 volatile float i_term      = 0.0f ;    // [Week 3] integral term (PWM counts), kept between ISRs
 volatile float I_max       = 1000.0f ; // [Week 3] max |I term| in PWM counts ("l" command)
 #define KI_MAX  200.0f                 // [Week 3] largest Ki the "i" command accepts
 volatile float p_term      = 0.0f ;    // [Week 3] Kp * error, for display
 volatile float d_term      = 0.0f ;    // [Week 3] -Kd * rate, for display
 volatile float rate_disp   = 0.0f ;    // [Week 3] gyro rate (deg/s), low-passed for display
-volatile float base_pwm    = 0.0f ;    // feed-forward / hover offset
+// [Week 3] D-term filter: the D term uses the average of the last D_avg_n
+// gyro readings (a moving average, updated every 1 ms). Averaging N samples
+// cuts random noise by about sqrt(N) and adds about (N-1)/2 ms of delay.
+// N = 1 means no filtering. Set with the "k" command.
+#define D_AVG_MAX 16
+volatile int   D_avg_n     = 4 ;
+float          d_hist[D_AVG_MAX] ;     // last D_AVG_MAX gyro rates
+int            d_hist_i    = 0 ;
+volatile float rate_d      = 0.0f ;    // averaged rate actually used by D
+volatile float base_pwm    = 1300.0f ; // feed-forward / hover offset (tuned default)
 volatile int   motor_on    = 0 ;       // 0 = motor forced off
 volatile float control     = 0.0f ;    // command sent to PWM (0..WRAPVAL)
 volatile float motor_disp  = 0.0f ;    // low-passed control, for display
@@ -135,6 +145,29 @@ float gyro_bias = 0.0f ;               // deg/s, measured at boot
 #define DEMO_HOLD 1                    // button held: motor off
 #define DEMO_RUN  2                    // released: stepping through targets
 volatile int   demo_state = DEMO_IDLE ;
+
+// [Week 3] IMU watchdog: if the IMU stops answering while running (e.g.
+// motor noise glitches the I2C bus), cut the motor and try to recover.
+#define IMU_BAD_LIMIT 5                // this many bad reads in a row (5 ms) = IMU lost
+volatile int   imu_bad_count = 0 ;
+volatile int   imu_fault     = 0 ;     // 1 = IMU lost, motor forced off
+volatile int   imu_lost_total = 0 ;    // how many times it has happened since boot
+
+// [Week 3] Vibration filtering for the accelerometer.
+// Motor vibration is much bigger than 1 g at the IMU. atan2() of a noisy
+// vector is biased (the noise does not average out), so the complementary
+// filter was being pulled to a wrong angle whenever the motor ran.
+//  1. dlpf_cfg: the MPU6050's own digital low-pass filter (register 0x1A).
+//       0 = off (260 Hz), 1 = 184 Hz, 2 = 94 Hz, 3 = 44 Hz, 4 = 21 Hz,
+//       5 = 10 Hz, 6 = 5 Hz. Also delays the gyro a little (3 -> ~5 ms).
+//       Set with the "w" command.
+//  2. acc_beta: low-pass the accel x and z COMPONENTS before atan2(), so
+//       vibration cancels out and only gravity is left. 1 = off,
+//       0.02 = ~50 ms time constant. Set with the "x" command.
+volatile int   dlpf_cfg  = 3 ;
+volatile float acc_beta  = 0.02f ;
+float acc_along_f = 0.0f ;             // filtered accel component along the arm (g)
+float acc_up_f    = 1.0f ;             // filtered accel component perpendicular (g)
 volatile float demo_time  = 0.0f ;     // seconds since the button was released
 
 ////////////////////////////////////////////////////////////////////////////
@@ -190,11 +223,72 @@ static int i2c_bus_recover(void) {   // returns 1 if SDA was stuck low
     return stuck ;
 }
 
+// [Week 3] Bring up the I2C bus and the MPU6050. Used at boot and again by
+// the IMU watchdog if the IMU is lost while running. Returns 1 if the IMU
+// answered WHO_AM_I with 0x68.
+static int imu_setup(int verbose) {
+    int was_stuck = i2c_bus_recover() ;   // un-stick the bus if the IMU was mid-transfer
+    if (verbose) printf("\r\nI2C bus: %s, SDA now %s\r\n",
+           was_stuck ? "was STUCK (SDA low), recovered" : "OK",
+           gpio_get(SDA_PIN) ? "high (good)" : "STILL LOW -- check wiring") ;
+    i2c_init(I2C_CHAN, I2C_BAUD_RATE) ;
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C) ;
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C) ;
+    gpio_pull_up(SDA_PIN) ;
+    gpio_pull_up(SCL_PIN) ;
+
+    // Full device reset of the MPU6050 (PWR_MGMT_1 bit 7), with a timeout
+    // so a missing/miswired IMU can't hang the boot
+    uint8_t dev_reset[] = {0x6B, 0x80} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, dev_reset, 2, false, 2000) ;
+    sleep_ms(100) ;
+    // Also reset the gyro/accel/temp signal paths (SIGNAL_PATH_RESET, 0x68),
+    // as the register map recommends after a device reset
+    uint8_t path_reset[] = {0x68, 0x07} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, path_reset, 2, false, 2000) ;
+    sleep_ms(100) ;
+
+    // WHO_AM_I (register 0x75) should read back 0x68
+    uint8_t reg = 0x75, who = 0 ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, &reg, 1, true, 2000) ;
+    int got = i2c_read_timeout_us(I2C_CHAN, ADDRESS, &who, 1, false, 2000) ;
+    if (!verbose) ;
+    else if (got == 1) printf("MPU6050 WHO_AM_I = 0x%02x (expect 0x68)\r\n", who) ;
+    else          printf("MPU6050 did not answer -- check VCC, GND, SDA=GP8, SCL=GP9\r\n") ;
+
+    mpu6050_reset() ;
+    // Use the X-gyro PLL as the clock (PWR_MGMT_1 = 0x01); the datasheet
+    // recommends it over the internal 8 MHz oscillator for stability
+    uint8_t clk_pll[] = {0x6B, 0x01} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, clk_pll, 2, false, 2000) ;
+    // [Week 3] Digital low-pass filter (CONFIG, 0x1A). With the DLPF on the
+    // gyro runs at 1 kHz internally, so the sample-rate divider (0x19) must
+    // be 0 to keep 1 kHz output (mpu6050_reset() set it to 7 = 125 Hz then).
+    uint8_t smplrt[] = {0x19, (uint8_t)(dlpf_cfg == 0 ? 7 : 0)} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, smplrt, 2, false, 2000) ;
+    uint8_t dlpf[] = {0x1A, (uint8_t)dlpf_cfg} ;
+    i2c_write_timeout_us(I2C_CHAN, ADDRESS, dlpf, 2, false, 2000) ;
+    sleep_ms(100) ;   // let the sensor settle after wake-up
+    return (got == 1 && who == 0x68) ;
+}
+
 // Angle from the accelerometer alone (degrees)
+// (raw, unfiltered; also resets the component filter to this reading)
 static inline float accel_angle(void) {
     float along = ACCEL_ALONG_SIGN * fix2float15(acceleration[ACCEL_ALONG_AXIS]) ;
     float up    = ACCEL_UP_SIGN    * fix2float15(acceleration[ACCEL_UP_AXIS]) ;
+    acc_along_f = along ;
+    acc_up_f    = up ;
     return atan2f(along, up) * RAD2DEG ;
+}
+
+// [Week 3] Angle from the low-passed accel components (used by the ISR)
+static inline float accel_angle_filtered(void) {
+    float along = ACCEL_ALONG_SIGN * fix2float15(acceleration[ACCEL_ALONG_AXIS]) ;
+    float up    = ACCEL_UP_SIGN    * fix2float15(acceleration[ACCEL_UP_AXIS]) ;
+    acc_along_f += (along - acc_along_f) * acc_beta ;
+    acc_up_f    += (up    - acc_up_f)    * acc_beta ;
+    return atan2f(acc_along_f, acc_up_f) * RAD2DEG ;
 }
 
 // Gyro rate about the hinge, bias removed (deg/s)
@@ -215,8 +309,34 @@ void on_pwm_wrap() {
     // 1. Read the IMU (accel in g, gyro in deg/s, 15.16 fixed point)
     mpu6050_read_raw(acceleration, gyro) ;
 
+    // 1b. [Week 3] Sanity check. Gravity is always there, so a real reading
+    //     has |accel| near 1 g. A failed I2C read comes back as all zeros.
+    {
+        float ax = fix2float15(acceleration[0]) ;
+        float ay = fix2float15(acceleration[1]) ;
+        float az = fix2float15(acceleration[2]) ;
+        if (imu_fault || (ax*ax + ay*ay + az*az) < 0.04f) {     // |a| < 0.2 g
+            if (!imu_fault && ++imu_bad_count >= IMU_BAD_LIMIT) {
+                imu_fault  = 1 ;                  // recovery runs in the demo thread
+                imu_lost_total += 1 ;
+                motor_on   = 0 ;
+                demo_state = DEMO_IDLE ;
+            }
+            // Don't update the angle from garbage. Motor off if lost.
+            if (imu_fault) {
+                control = 0.0f ;
+                p_term = 0.0f ; d_term = 0.0f ; i_term = 0.0f ;
+                pwm_set_gpio_level(PWM_PIN, 0) ;
+                motor_disp = motor_disp + (0.0f - motor_disp) * (1.0f / 16.0f) ;
+            }
+            gpio_put(14, 0) ;
+            return ;
+        }
+        imu_bad_count = 0 ;
+    }
+
     // 2. Complementary filter
-    float a_deg = accel_angle() ;
+    float a_deg = accel_angle_filtered() ;    // [Week 3] components low-passed first
     float rate  = gyro_rate() ;
     float g_part = alpha * (angle_deg + rate * DT) ;   // gyro path
     float a_part = (1.0f - alpha) * a_deg ;            // accel path
@@ -228,6 +348,17 @@ void on_pwm_wrap() {
     accel_part = a_part ;
     angle_deg  = new_angle ;
 
+    // 2b. [Week 3] Moving average of the gyro rate for the D term
+    d_hist[d_hist_i] = rate ;
+    d_hist_i = (d_hist_i + 1) % D_AVG_MAX ;
+    {
+        int n = D_avg_n ;
+        float sum = 0.0f ;
+        for (int k = 1; k <= n; k++)
+            sum += d_hist[(d_hist_i - k + D_AVG_MAX) % D_AVG_MAX] ;
+        rate_d = sum / (float)n ;
+    }
+
     // 3. PID control (with a constant feed-forward term)   [Week 3]
     //    P pushes toward the target; D brakes any rotation;
     //    I slowly adds up any error that stays, until it is gone.
@@ -237,7 +368,7 @@ void on_pwm_wrap() {
     if (motor_on) {
         float error = target_deg - new_angle ;
         float p = Kp * error ;
-        float d = -Kd * rate ;
+        float d = -Kd * rate_d ;           // averaged rate (see 2b)
 
         // Integral with anti-windup: if the motor is already maxed out
         // (or off) in the direction the error asks for, don't keep adding,
@@ -334,7 +465,8 @@ static PT_THREAD (protothread_draw(struct pt *pt))
     while (1) {
         // Wait for a buffer swap
         PT_YIELD_UNTIL(pt, draw_start_signal()) ;
-        gpio_put(15, !gpio_get(15)) ;
+        // (GPIO 15 used to toggle here as a frame-rate debug output; it is
+        //  now the demo button input, so the toggle was removed)
 
         clearLowFrame(0, BLACK) ;
         drawAxes() ;
@@ -345,19 +477,24 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         sprintf(screentext, "Kp=%.1f  Ki=%.1f  Kd=%.2f  base=%.0f  target=%.1f deg  motor %s",
                 Kp, Ki, Kd, base_pwm, target_deg, motor_on ? "ON " : "OFF") ;
         writeString(screentext) ;
+        // Vibration filter settings, top right
+        setCursor(470, 10) ;
+        sprintf(screentext, "dlpf=%d xbeta=%.3f", dlpf_cfg, acc_beta) ;
+        writeString(screentext) ;
         // Demo status, top right
         setCursor(470, 24) ;
         if      (demo_state == DEMO_RUN)  sprintf(screentext, "DEMO t=%5.1f s ", demo_time) ;
         else if (demo_state == DEMO_HOLD) sprintf(screentext, "DEMO: button held") ;
         else                              sprintf(screentext, "                 ") ;
+        if (imu_fault)                    sprintf(screentext, "!! IMU LOST !!   ") ;
         writeString(screentext) ;
         setCursor(10, 24) ;
         sprintf(screentext, "angle=%6.1f  accel-only=%6.1f  gyro-only=%6.1f  cmd=%4.0f",
                 angle_deg, accel_deg, gyro_deg, motor_disp) ;
         writeString(screentext) ;
         setCursor(10, 48) ;
-        sprintf(screentext, "cmd = base %5.0f + P %6.0f + I %5.0f/%4.0f + D %6.0f (rate %6.1f)",
-                base_pwm, p_term, i_term, I_max, d_term, rate_disp) ;
+        sprintf(screentext, "cmd = base %5.0f + P %6.0f + I %5.0f/%4.0f + D %6.0f (rate %6.1f, D avg %d)",
+                base_pwm, p_term, i_term, I_max, d_term, rate_disp, D_avg_n) ;
         writeString(screentext) ;
         setCursor(10, 38) ;
         sprintf(screentext, "filter: %.3f*(gyro path)=%7.2f + %.3f*accel=%6.2f -> %6.1f",
@@ -387,6 +524,9 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //   d 2      set Kd   [Week 3]
 //   i 20     set Ki   [Week 3]  (0..200)
 //   l 1000   set the max |I term| in PWM counts  [Week 3]
+//   k 4      D-term filter: average the last N gyro readings (1 = off, max 16)
+//   w 3      MPU6050 low-pass filter: 0 = off ... 3 = 44 Hz ... 6 = 5 Hz
+//   x 0.02   accel low-pass before atan2 (1 = off, smaller = smoother)
 //   z        reboot the Pico (re-inits the IMU and recalibrates the gyro)
 //   a 0      set target angle in degrees (-90 down, 0 horizontal)
 //   b 2500   set base (feed-forward) PWM, 0..6000
@@ -404,7 +544,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     static int n ;
 
     sprintf(pt_serial_out_buffer,
-            "\r\nCommands: p <Kp>, i <Ki>, d <Kd>, l <Imax>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, g, z, ?\r\n") ;
+            "\r\nCommands: p <Kp>, i <Ki>, d <Kd>, l <Imax>, k <Navg>, w <dlpf>, x <beta>, a <deg>, b <base>, f <alpha>, m <0|1>, t <ms>, r, g, z, ?\r\n") ;
     serial_write ;
 
     while (1) {
@@ -420,7 +560,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             // Note: the IMU itself stays powered; unplug USB for a full power cycle.
             motor_on = 0 ;
             pwm_set_gpio_level(PWM_PIN, 0) ;
-            sprintf(pt_serial_out_buffer, "rebooting... keep the arm still\r\n") ;
+            sprintf(pt_serial_out_buffer, "rebooting... keep the arm still (if the gyro check fails, unplug USB instead)\r\n") ;
             serial_write ;
             sleep_ms(50) ;               // let the UART finish sending
             watchdog_reboot(0, 0, 10) ;  // reboot in 10 ms
@@ -428,6 +568,22 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         }
         else if (cmd == 'i' && n == 2) {
             Ki = clampf(val, 0.0f, KI_MAX) ;
+        }
+        else if (cmd == 'w' && n == 2) {
+            // Change the MPU6050 DLPF. Keep the ISR off the I2C bus meanwhile.
+            dlpf_cfg = (int)clampf(val, 0.0f, 6.0f) ;
+            irq_set_enabled(PWM_IRQ_WRAP, false) ;
+            uint8_t smplrt[] = {0x19, (uint8_t)(dlpf_cfg == 0 ? 7 : 0)} ;
+            i2c_write_timeout_us(I2C_CHAN, ADDRESS, smplrt, 2, false, 2000) ;
+            uint8_t dlpf[] = {0x1A, (uint8_t)dlpf_cfg} ;
+            i2c_write_timeout_us(I2C_CHAN, ADDRESS, dlpf, 2, false, 2000) ;
+            irq_set_enabled(PWM_IRQ_WRAP, true) ;
+        }
+        else if (cmd == 'x' && n == 2) {
+            acc_beta = clampf(val, 0.001f, 1.0f) ;
+        }
+        else if (cmd == 'k' && n == 2) {
+            D_avg_n = (int)clampf(val, 1.0f, (float)D_AVG_MAX) ;
         }
         else if (cmd == 'l' && n == 2) {
             I_max = clampf(val, 0.0f, (float)WRAPVAL) ;
@@ -450,6 +606,11 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         }
         else if (cmd == 'm' && n == 2) {
             demo_state = DEMO_IDLE ;            // manual motor control cancels the demo
+            if (imu_fault && val != 0.0f) {
+                sprintf(pt_serial_out_buffer, "IMU is lost, motor stays OFF\r\n") ;
+                serial_write ;
+                continue ;
+            }
             motor_on = (val != 0.0f) ;
         }
         else if (cmd == 't' && n == 2) {
@@ -474,9 +635,9 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         }
 
         sprintf(pt_serial_out_buffer,
-                "Kp=%.2f Ki=%.2f Kd=%.3f base=%.0f target=%.1f alpha=%.4f motor=%s angle=%.1f I=%.0f Imax=%.0f bias=%.2f\r\n",
-                Kp, Ki, Kd, base_pwm, target_deg, alpha, motor_on ? "ON" : "OFF",
-                angle_deg, i_term, I_max, gyro_bias) ;
+                "Kp=%.2f Ki=%.2f Kd=%.3f Davg=%d base=%.0f target=%.1f alpha=%.4f motor=%s angle=%.1f I=%.0f Imax=%.0f bias=%.2f imu_lost=%d dlpf=%d xbeta=%.3f\r\n",
+                Kp, Ki, Kd, D_avg_n, base_pwm, target_deg, alpha, motor_on ? "ON" : "OFF",
+                angle_deg, i_term, I_max, gyro_bias, imu_lost_total, dlpf_cfg, acc_beta) ;
         serial_write ;
     }
     PT_END(pt) ;
@@ -485,7 +646,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
 ////////////////////////////////////////////////////////////////////////////
 /////////////////////////// DEMO BUTTON THREAD /////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
-// [Week 3, stage 3] Polls the button every 10 ms. The button pulls GPIO 2
+// [Week 3, stage 3] Polls the button every 10 ms. The button pulls GPIO 15
 // to GND, so pressed = 0. Requires 2 readings in a row (20 ms) to count a
 // press or a release, which ignores contact bounce.
 static PT_THREAD (protothread_demo(struct pt *pt))
@@ -495,6 +656,35 @@ static PT_THREAD (protothread_demo(struct pt *pt))
 
     while (1) {
         PT_YIELD_usec(10000) ;
+
+        // [Week 3] IMU watchdog recovery. The ISR has already cut the motor.
+        if (imu_fault) {
+            printf("\r\n!!! IMU LOST (I2C reads all zero) -- motor OFF, recovering...\r\n") ;
+            irq_set_enabled(PWM_IRQ_WRAP, false) ;      // keep the ISR off the bus
+            pwm_set_gpio_level(PWM_PIN, 0) ;
+            int ok = imu_setup(0) ;
+            sleep_ms(20) ;
+            mpu6050_read_raw(acceleration, gyro) ;
+            float ax = fix2float15(acceleration[0]) ;
+            float ay = fix2float15(acceleration[1]) ;
+            float az = fix2float15(acceleration[2]) ;
+            ok = ok && (ax*ax + ay*ay + az*az) > 0.04f ;
+            if (ok) {
+                angle_deg = accel_angle() ;               // restart the filter
+                gyro_deg  = angle_deg ;
+                accel_deg = angle_deg ;
+                imu_bad_count = 0 ;
+                imu_fault = 0 ;
+                printf("IMU back (lost %d time%s so far). Motor stays OFF: type m 1\r\n",
+                       imu_lost_total, imu_lost_total == 1 ? "" : "s") ;
+            }
+            else {
+                printf("IMU still not answering -- check SDA=GP8, SCL=GP9, 3V3, GND. Retrying...\r\n") ;
+            }
+            irq_set_enabled(PWM_IRQ_WRAP, true) ;
+            if (!ok) PT_YIELD_usec(500000) ;
+            continue ;
+        }
 
         if (!gpio_get(BUTTON_PIN)) {
             PT_YIELD_usec(10000) ;
@@ -517,7 +707,7 @@ static PT_THREAD (protothread_demo(struct pt *pt))
             t_release  = time_us_64() ;
             demo_time  = 0.0f ;
             target_deg = 0.0f ;
-            motor_on   = 1 ;
+            motor_on   = imu_fault ? 0 : 1 ;
             demo_state = DEMO_RUN ;
             printf("DEMO: released, t = 0, target 0\r\n") ;
         }
@@ -538,9 +728,7 @@ static PT_THREAD (protothread_demo(struct pt *pt))
 //////////////////////////////// STARTUP ///////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
 void core1_entry() {
-    gpio_init(15) ;
-    gpio_set_dir(15, GPIO_OUT) ;
-    gpio_put(15, 0) ;
+    // GPIO 15 is the demo button (input), set up in main()
     pt_add_thread(protothread_draw) ;
     pt_schedule_start ;
 }
@@ -556,41 +744,37 @@ int main() {
     gpio_put(14, 0) ;
 
     //////////////////////////// I2C + IMU ////////////////////////////////
-    int was_stuck = i2c_bus_recover() ;   // un-stick the bus if the IMU was mid-transfer
-    printf("\r\nI2C bus: %s, SDA now %s\r\n",
-           was_stuck ? "was STUCK (SDA low), recovered" : "OK",
-           gpio_get(SDA_PIN) ? "high (good)" : "STILL LOW -- check wiring") ;
-    i2c_init(I2C_CHAN, I2C_BAUD_RATE) ;
-    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C) ;
-    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C) ;
-    gpio_pull_up(SDA_PIN) ;
-    gpio_pull_up(SCL_PIN) ;
-
-    // Full device reset of the MPU6050 (PWR_MGMT_1 bit 7), with a timeout
-    // so a missing/miswired IMU can't hang the boot
-    uint8_t dev_reset[] = {0x6B, 0x80} ;
-    i2c_write_timeout_us(I2C_CHAN, ADDRESS, dev_reset, 2, false, 2000) ;
-    sleep_ms(100) ;
-
-    // WHO_AM_I (register 0x75) should read back 0x68
-    uint8_t reg = 0x75, who = 0 ;
-    i2c_write_timeout_us(I2C_CHAN, ADDRESS, &reg, 1, true, 2000) ;
-    int got = i2c_read_timeout_us(I2C_CHAN, ADDRESS, &who, 1, false, 2000) ;
-    if (got == 1) printf("MPU6050 WHO_AM_I = 0x%02x (expect 0x68)\r\n", who) ;
-    else          printf("MPU6050 did not answer -- check VCC, GND, SDA=GP8, SCL=GP9\r\n") ;
-
-    mpu6050_reset() ;
-    sleep_ms(100) ;   // let the sensor settle after wake-up
+    imu_setup(1) ;
 
     // Gyro bias: average 1000 readings (~1.5 s). Keep the arm STILL.
+    // Sanity check: at rest the bias should be small and the readings
+    // steady. After a soft reboot ("z") we have seen the hinge gyro come up
+    // offset by ~-35 deg/s and jumping around; then only a power cycle helps.
     printf("\r\nCalibrating gyro, keep the arm still...\r\n") ;
-    float sum = 0.0f ;
-    for (int k = 0; k < 1000; k++) {
-        mpu6050_read_raw(acceleration, gyro) ;
-        sum += GYRO_SIGN * fix2float15(gyro[GYRO_AXIS]) ;
-        sleep_us(1000) ;
+    int good = 0 ;
+    for (int attempt = 1; attempt <= 3 && !good; attempt++) {
+        for (int k = 0; k < 200; k++) {          // throw away 200 ms of start-up data
+            mpu6050_read_raw(acceleration, gyro) ;
+            sleep_us(1000) ;
+        }
+        float sum = 0.0f, lo = 1e9f, hi = -1e9f ;
+        for (int k = 0; k < 1000; k++) {
+            mpu6050_read_raw(acceleration, gyro) ;
+            float g = GYRO_SIGN * fix2float15(gyro[GYRO_AXIS]) ;
+            sum += g ;
+            if (g < lo) lo = g ;
+            if (g > hi) hi = g ;
+            sleep_us(1000) ;
+        }
+        gyro_bias = sum / 1000.0f ;
+        good = (fabsf(gyro_bias) < 5.0f) && ((hi - lo) < 15.0f) ;
+        printf("  try %d: bias = %.3f deg/s, spread = %.1f deg/s  %s\r\n",
+               attempt, gyro_bias, hi - lo, good ? "OK" : "BAD") ;
     }
-    gyro_bias = sum / 1000.0f ;
+    if (!good) {
+        printf("\r\n!!! GYRO LOOKS WRONG: unplug USB for 10 s to power-cycle the IMU !!!\r\n") ;
+        printf("!!! (arm moving during calibration also causes this)            !!!\r\n\r\n") ;
+    }
     angle_deg = accel_angle() ;   // start the filter at the accel angle
     gyro_deg  = angle_deg ;       // gyro-only starts at the same place
     accel_deg = angle_deg ;
@@ -600,7 +784,8 @@ int main() {
         gyro_buf[k]  = angle_deg ;
         motor_buf[k] = 0.0f ;
     }
-    printf("gyro bias = %.3f deg/s, start angle = %.1f deg\r\n", gyro_bias, angle_deg) ;
+    printf("gyro bias = %.3f deg/s, start angle = %.1f deg%s\r\n", gyro_bias, angle_deg,
+           good ? "" : "   <-- NOT TRUSTED") ;
 
     /////////////////////////////// PWM ///////////////////////////////////
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM) ;
