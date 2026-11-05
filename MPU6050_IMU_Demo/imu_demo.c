@@ -172,6 +172,19 @@ volatile int imu_lost_total = 0;  // how many times it has happened since boot
 // ACCEL_LP = 0.02 gives a time constant of about 1 ms / 0.02 = 50 ms.
 #define ACCEL_LP 0.02f
 float accel_f[3] = {0.0f, 0.0f, 1.0f};  // low-passed accel x, y, z (g)
+
+// [Week 3] Alternative we also tried: the MPU6050's own hardware digital
+// low-pass filter (DLPF, register 0x1A "CONFIG"). It filters the accel AND
+// gyro inside the sensor before we read them. Bandwidth by DLPF_CFG:
+//   0 = off (accel 260 Hz)   1 = 184 Hz   2 = 94 Hz   3 = 44 Hz
+//   4 = 21 Hz   5 = 10 Hz   6 = 5 Hz
+// It also delays the gyro (about 5 ms at setting 3), which slows the D term.
+// With the DLPF on, the gyro runs at 1 kHz internally, so the sample-rate
+// divider (0x19) must be 0 to keep reading new data every 1 ms.
+// NOT USED: the software filter above fixes the angle without delaying
+// the gyro. Set USE_HW_DLPF to 1 to turn it on.
+#define USE_HW_DLPF 0
+#define DLPF_CFG 3
 volatile float demo_time = 0.0f;        // seconds since the button was released
 
 ////////////////////////////////////////////////////////////////////////////
@@ -291,6 +304,13 @@ static int imu_setup(int verbose) {
   // recommends it over the internal 8 MHz oscillator for stability
   uint8_t clk_pll[] = {0x6B, 0x01};
   i2c_write_timeout_us(I2C_CHAN, ADDRESS, clk_pll, 2, false, 2000);
+#if USE_HW_DLPF
+  // [Week 3] Hardware low-pass filter (not used by default, see USE_HW_DLPF)
+  uint8_t smplrt[] = {0x19, 0x00};  // sample-rate divider 0: 1 kHz with DLPF on
+  i2c_write_timeout_us(I2C_CHAN, ADDRESS, smplrt, 2, false, 2000);
+  uint8_t dlpf[] = {0x1A, DLPF_CFG};  // CONFIG register: DLPF bandwidth
+  i2c_write_timeout_us(I2C_CHAN, ADDRESS, dlpf, 2, false, 2000);
+#endif
   sleep_ms(100);  // let the sensor settle after wake-up
   return (got == 1 && who == 0x68);
 }
